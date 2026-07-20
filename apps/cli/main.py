@@ -174,6 +174,61 @@ def events(limit: int = 20) -> None:
         )
 
 
+@app.command()
+def ingest(path: str) -> None:
+    """Ingest a text file or directory into memory."""
+    _ensure_server()
+    report = httpx.post(f"{BASE}/v1/ingest", json={"path": path}, timeout=300.0).json()
+    if not report.get("ok"):
+        console.print(f"[red]{report.get('error', 'ingest failed')}[/red]")
+        return
+    console.print(
+        f"[green]ingested[/green] {report['files_ingested']} files, "
+        f"{report['chunks']} chunks"
+        + (f" · skipped: {', '.join(report['skipped'])}" if report["skipped"] else "")
+    )
+
+
+@app.command()
+def recall(query: str, k: int = 6) -> None:
+    """Search memory; results carry source, date, and trust level."""
+    _ensure_server()
+    hits = httpx.post(f"{BASE}/v1/memory/query", json={"q": query, "k": k}, timeout=30.0).json()[
+        "hits"
+    ]
+    if not hits:
+        console.print("[dim]no memories matched[/dim]")
+        return
+    for h in hits:
+        trust = "[green]trusted[/green]" if h["trusted"] else "[yellow]untrusted[/yellow]"
+        console.print(
+            Panel(
+                h["text"][:500],
+                title=f"{h['event_id']} · {h['ts'][:10]} · {h['source']} · {trust}",
+                border_style="magenta",
+            )
+        )
+
+
+@app.command()
+def forget(event_id: str) -> None:
+    """Tombstone a memory and verify it is gone from every projection."""
+    _ensure_server()
+    report = httpx.post(
+        f"{BASE}/v1/memory/forget", json={"event_id": event_id}, timeout=30.0
+    ).json()
+    mark = "[green]verified forgotten[/green]" if report["verified"] else "[red]NOT VERIFIED[/red]"
+    console.print(f"{report['event_id']}: {mark}")
+
+
+@app.command()
+def reindex() -> None:
+    """Rebuild the memory index from the event log (projections are disposable)."""
+    _ensure_server()
+    report = httpx.post(f"{BASE}/v1/memory/reindex", timeout=300.0).json()
+    console.print(f"[green]reprojected[/green] {report['reprojected']} events")
+
+
 def main() -> None:
     app()
 

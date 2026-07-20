@@ -9,9 +9,10 @@ from pathlib import Path
 import pytest
 
 from core.config import Config
-from core.events.schema import EventType, ulid
+from core.events.schema import Event, EventType, Provenance, ulid
 from core.events.store import EventStore
 from core.executor_client import ExecutorClient
+from core.memory.store import MemoryStore
 from core.models.fake_adapter import FakeAdapter
 from core.models.gateway import ModelGateway, ModelResponse, ToolCall
 from core.orchestrator.loop import ApprovalRegistry, Orchestrator
@@ -31,15 +32,15 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 def _orchestrator(config: Config, db: Database, script: list[ModelResponse]):
-    events = EventStore(db)
+    memory = MemoryStore(db, EventStore(db))
     traces = TraceStore(db)
     policy = PolicyEngine(db)
     approvals = ApprovalRegistry()
     executor = ExecutorClient(config.workspace)
     orch = Orchestrator(
-        config, events, traces, policy, ModelGateway(FakeAdapter(script)), executor, approvals
+        config, memory, traces, policy, ModelGateway(FakeAdapter(script)), executor, approvals
     )
-    return orch, events, traces, policy, approvals, executor
+    return orch, memory.events, traces, policy, approvals, executor
 
 
 async def test_full_turn_with_approval(env) -> None:
@@ -179,6 +180,54 @@ async def test_persistent_retry_stops_the_turn(env) -> None:
     assert kinds[-1] == "error"  # turn stopped, model never got its "final" say
     assert "final" not in kinds
     assert not (config.workspace / "hello.txt").exists()
+
+
+async def test_untrusted_memory_is_injected_and_taints_the_turn(env) -> None:
+    """Gen 2 spine: an ingested (untrusted) memory must (a) appear in the
+    system prompt with its source, and (b) taint the turn so even auto-allowed
+    reads escalate to an approval card."""
+    config, db = env
+    memory = MemoryStore(db, EventStore(db))
+    doc = memory.record(
+        Event(
+            type=EventType.INGEST_DOCUMENT.value,
+            provenance=Provenance(source="connector:file:seminar.md", trusted=False),
+            payload={"text": "The seminar on quantum error correction is on Friday."},
+        )
+    )
+    adapter = FakeAdapter(
+        [
+            ModelResponse(
+                text="",
+                tool_calls=[ToolCall(id=ulid(), name="fs_read", arguments={"path": "notes.txt"})],
+            ),
+            ModelResponse(text="Checked.", tool_calls=[]),
+        ]
+    )
+    traces = TraceStore(db)
+    policy = PolicyEngine(db)
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(
+        config, memory, traces, policy, ModelGateway(adapter), executor, approvals
+    )
+
+    approval_for_read = False
+    try:
+        async for ev in orch.run_turn("s1", "when is the quantum seminar?"):
+            if ev.kind == "approval_request" and ev.data["tool"] == "fs_read":
+                approval_for_read = True
+                approvals.resolve(ev.data["approval_id"], approved=True, scope="once")
+    finally:
+        await executor.close()
+
+    # (a) memory injected with provenance annotation
+    assert "quantum error correction" in adapter.systems[0]
+    assert "connector:file:seminar.md" in adapter.systems[0]
+    assert "UNTRUSTED" in adapter.systems[0]
+    assert doc.id in adapter.systems[0]
+    # (b) normally auto-allowed fs_read required approval because turn was tainted
+    assert approval_for_read is True
 
 
 async def test_plain_answer_no_tools(env) -> None:

@@ -34,16 +34,18 @@ class EventStore:
         return event
 
     def recent(self, types: list[str] | None = None, limit: int = 50) -> list[Event]:
-        """Most recent events, returned oldest-first for direct use as history."""
+        """Most recent non-tombstoned events, oldest-first for direct use as history."""
+        not_dead = "id NOT IN (SELECT event_id FROM tombstones)"
         if types:
             marks = ",".join("?" * len(types))
             rows = self._db.conn.execute(
-                f"SELECT * FROM events WHERE type IN ({marks}) ORDER BY rowid DESC LIMIT ?",
+                f"SELECT * FROM events WHERE type IN ({marks}) AND {not_dead} "
+                "ORDER BY rowid DESC LIMIT ?",
                 (*types, limit),
             ).fetchall()
         else:
             rows = self._db.conn.execute(
-                "SELECT * FROM events ORDER BY rowid DESC LIMIT ?", (limit,)
+                f"SELECT * FROM events WHERE {not_dead} ORDER BY rowid DESC LIMIT ?", (limit,)
             ).fetchall()
         return [self._row_to_event(r) for r in reversed(rows)]
 

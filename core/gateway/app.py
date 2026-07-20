@@ -17,6 +17,8 @@ from pydantic import BaseModel
 from core.config import CONFIG, Config
 from core.events.store import EventStore
 from core.executor_client import ExecutorClient
+from core.ingest.files import FileIngestor
+from core.memory.store import MemoryStore
 from core.models.fake_adapter import FakeAdapter
 from core.models.gateway import ModelAdapter, ModelGateway
 from core.orchestrator.loop import ApprovalRegistry, Orchestrator, stream_event_json
@@ -68,12 +70,14 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
     config.ensure_dirs()
     db = Database(config.db_path)
     events = EventStore(db)
+    memory = MemoryStore(db, events)
+    ingestor = FileIngestor(memory, config.device_id)
     traces = TraceStore(db)
     policy = PolicyEngine(db)
     approvals = ApprovalRegistry()
     executor = ExecutorClient(config.workspace)
     gateway = ModelGateway(adapter or _make_adapter(config))
-    orch = Orchestrator(config, events, traces, policy, gateway, executor, approvals)
+    orch = Orchestrator(config, memory, traces, policy, gateway, executor, approvals)
 
     app = FastAPI(title="M.I.K.E.Y Gateway", version="0.1.0")
     app.state.policy = policy
@@ -104,6 +108,40 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
         if not spans:
             raise HTTPException(404, "unknown turn")
         return {"turn_id": turn_id, "spans": spans}
+
+    class IngestRequest(BaseModel):
+        path: str
+
+    class RecallRequest(BaseModel):
+        q: str
+        k: int = 6
+
+    class ForgetRequest(BaseModel):
+        event_id: str
+        reason: str = "user request"
+
+    @app.post("/v1/ingest")
+    async def ingest(req: IngestRequest) -> dict[str, Any]:
+        return ingestor.ingest_path(req.path)
+
+    @app.post("/v1/memory/query")
+    async def memory_query(req: RecallRequest) -> dict[str, Any]:
+        hits = memory.recall(req.q, k=req.k)
+        return {
+            "hits": [
+                {"event_id": h.event_id, "source": h.source, "trusted": h.trusted,
+                 "ts": h.ts, "text": h.text, "rank": h.rank}
+                for h in hits
+            ]
+        }
+
+    @app.post("/v1/memory/forget")
+    async def memory_forget(req: ForgetRequest) -> dict[str, Any]:
+        return memory.forget(req.event_id, req.reason)
+
+    @app.post("/v1/memory/reindex")
+    async def memory_reindex() -> dict[str, int]:
+        return {"reprojected": memory.reindex()}
 
     @app.get("/v1/events")
     async def get_events(limit: int = 20) -> dict[str, Any]:

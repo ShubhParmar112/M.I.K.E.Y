@@ -55,6 +55,22 @@ MIGRATIONS: list[list[str]] = [
             ts TEXT NOT NULL
         )""",
     ],
+    # v2 — Gen 2: memory projection (FTS index over the log) + tombstones.
+    # The FTS table is a rebuildable projection; the log stays the truth.
+    [
+        """CREATE VIRTUAL TABLE memory_fts USING fts5(
+            event_id UNINDEXED,
+            source UNINDEXED,
+            trusted UNINDEXED,
+            ts UNINDEXED,
+            text
+        )""",
+        """CREATE TABLE tombstones (
+            event_id TEXT PRIMARY KEY,
+            ts TEXT NOT NULL,
+            reason TEXT NOT NULL
+        )""",
+    ],
 ]
 
 

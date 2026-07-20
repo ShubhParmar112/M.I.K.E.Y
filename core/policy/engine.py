@@ -59,8 +59,10 @@ class PolicyEngine:
         base = RULES.get(req.tool)
         if base is None:
             result = PolicyResult(Decision.DENY, f"tool '{req.tool}' is not in the policy table")
-        elif req.tainted and base is Decision.ALLOW and req.tool != "web_fetch":
-            # Untrusted content may inform but never authorize (review W4).
+        elif req.tainted and base is Decision.ALLOW:
+            # Untrusted content may inform but never authorize (review W4). This
+            # includes web_fetch: a tainted turn fetching a crafted URL is the
+            # classic exfiltration channel, so it must go through the user.
             result = PolicyResult(Decision.ASK, "input derived from untrusted content")
         elif base is Decision.ASK and self._signature(req) in self._session_grants.get(
             req.session_id, set()

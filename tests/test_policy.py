@@ -21,6 +21,10 @@ def test_reads_allowed_writes_ask_unknown_denied(db: Database) -> None:
 def test_taint_escalates_allow_to_ask(db: Database) -> None:
     policy = PolicyEngine(db)
     assert policy.evaluate(_req("fs_read", tainted=True)).decision is Decision.ASK
+    # web_fetch included: a tainted turn fetching a crafted URL is the classic
+    # exfiltration channel and must go through the user
+    assert policy.evaluate(_req("web_fetch", tainted=True)).decision is Decision.ASK
+    assert policy.evaluate(_req("web_fetch", tainted=False)).decision is Decision.ALLOW
 
 
 def test_session_grant_converts_ask_to_allow(db: Database) -> None:

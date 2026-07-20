@@ -33,6 +33,12 @@ $env:GROQ_API_KEY = "gsk_..."               # cloud (Groq, free tier, Llama 3.3)
 uv run mikey chat            # interactive chat with approval cards
 uv run mikey trace           # "why did you do that?" — trace tree of the last turn
 uv run mikey events          # inspect the event log
+
+# Gen 2 — memory
+uv run mikey ingest <path>   # ingest text files/folders into memory (marked untrusted)
+uv run mikey recall "query"  # search memory — results carry source, date, trust
+uv run mikey forget <id>     # tombstone a memory; verified gone from all projections
+uv run mikey reindex         # rebuild the memory index from the event log
 ```
 
 Data lives in `~/.mikey/` (event log, audit chain, traces); the agent's sandbox is `~/.mikey/workspace/`. Reads are auto-allowed; writes and commands require approval (`y` once / `s` for the session); unknown tools are denied. Web content is taint-marked and can never authorize actions.
@@ -49,7 +55,9 @@ Data lives in `~/.mikey/` (event log, audit chain, traces); the agent's sandbox 
 | Turn loop (plan → policy → act → trace) | ✅ `core/orchestrator/` |
 | Session gateway API (SSE streaming, approvals, traces) | ✅ `core/gateway/` |
 | CLI with approval cards + trace viewer | ✅ `apps/cli/` |
-| Textual TUI, retrieval, memory tiers | ⏳ next |
+| CI (ruff + pytest on every push) | ✅ `.github/workflows/` |
+| Memory: FTS retrieval, ingestion, verified forgetting, taint | ✅ `core/memory/`, `core/ingest/` |
+| Textual TUI, vector retrieval, memory tiers, contradiction flags | ⏳ next |
 
 ## Non-negotiable principles
 

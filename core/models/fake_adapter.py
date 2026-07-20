@@ -13,6 +13,7 @@ class FakeAdapter:
     def __init__(self, script: list[ModelResponse] | None = None) -> None:
         self._script = list(script or [])
         self.calls: list[list[ChatMessage]] = []
+        self.systems: list[str] = []
 
     async def complete(
         self,
@@ -21,6 +22,7 @@ class FakeAdapter:
         tools: list[dict[str, Any]],
     ) -> ModelResponse:
         self.calls.append(list(messages))
+        self.systems.append(system)
         if self._script:
             return self._script.pop(0)
         return ModelResponse(
