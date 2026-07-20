@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# M.I.K.E.Y runtime data lives in ~/.mikey, never in the repo — but guard anyway
+.mikey/
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets — never commit keys
+.env
