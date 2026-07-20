@@ -25,9 +25,10 @@ This repository currently contains the **engineering foundation** — the design
 uv sync                      # install
 uv run pytest                # verify (16 tests)
 
-# pick a model provider (either works):
+# pick a model provider (any of the three):
 $env:ANTHROPIC_API_KEY = "sk-ant-..."       # cloud (Claude), or:
-# install Ollama + `ollama pull llama3.2`   # local
+$env:GROQ_API_KEY = "gsk_..."               # cloud (Groq, free tier, Llama 3.3), or:
+# install Ollama + `ollama pull llama3.2`   # local / private
 
 uv run mikey chat            # interactive chat with approval cards
 uv run mikey trace           # "why did you do that?" — trace tree of the last turn

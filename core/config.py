@@ -11,15 +11,19 @@ def _default_home() -> Path:
     return Path(os.environ.get("MIKEY_HOME", str(Path.home() / ".mikey")))
 
 
+def _detect_provider() -> str:
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if os.environ.get("GROQ_API_KEY"):
+        return "groq"
+    return "ollama"
+
+
 @dataclass(frozen=True)
 class Config:
     home: Path = field(default_factory=_default_home)
     port: int = field(default_factory=lambda: int(os.environ.get("MIKEY_PORT", "43110")))
-    provider: str = field(
-        default_factory=lambda: os.environ.get(
-            "MIKEY_PROVIDER", "anthropic" if os.environ.get("ANTHROPIC_API_KEY") else "ollama"
-        )
-    )
+    provider: str = field(default_factory=lambda: os.environ.get("MIKEY_PROVIDER", _detect_provider()))
     anthropic_model: str = field(
         default_factory=lambda: os.environ.get("MIKEY_MODEL", "claude-sonnet-5")
     )
@@ -28,6 +32,9 @@ class Config:
     )
     ollama_model: str = field(
         default_factory=lambda: os.environ.get("MIKEY_OLLAMA_MODEL", "llama3.2")
+    )
+    groq_model: str = field(
+        default_factory=lambda: os.environ.get("MIKEY_GROQ_MODEL", "llama-3.3-70b-versatile")
     )
     # Approximate context budget for assembly, in characters (~4 chars/token).
     context_budget_chars: int = 24_000

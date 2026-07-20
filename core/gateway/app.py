@@ -28,6 +28,10 @@ def _make_adapter(config: Config) -> ModelAdapter:
         from core.models.anthropic_adapter import AnthropicAdapter
 
         return AnthropicAdapter(config.anthropic_model)
+    if config.provider == "groq":
+        from core.models.groq_adapter import GroqAdapter
+
+        return GroqAdapter(config.groq_model)
     if config.provider == "ollama":
         from core.models.ollama_adapter import OllamaAdapter
 
