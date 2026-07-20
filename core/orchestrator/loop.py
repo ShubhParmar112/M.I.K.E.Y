@@ -96,6 +96,8 @@ class Orchestrator:
 
         messages = ctx.messages
         tainted_turn = False  # once untrusted content enters, later actions are tainted
+        denied_signatures: set[str] = set()  # user-denied actions this turn
+        auto_denies = 0
 
         for _step in range(MAX_STEPS):
             try:
@@ -133,6 +135,44 @@ class Orchestrator:
 
             for tc in resp.tool_calls:
                 yield StreamEvent("action", {"tool": tc.name, "args": tc.arguments})
+
+                # The user's denial is enforced by the system, not by the model's
+                # obedience: an identical re-proposal never reaches the user again.
+                sig = json.dumps(
+                    {"tool": tc.name, "args": tc.arguments}, sort_keys=True, ensure_ascii=False
+                )
+                if sig in denied_signatures:
+                    auto_denies += 1
+                    auto_req = ActionRequest(
+                        tool=tc.name, args=tc.arguments, turn_id=turn_id,
+                        session_id=session_id, tainted=tainted_turn,
+                    )
+                    self._policy.record_auto_denial(auto_req)
+                    self._traces.span(
+                        turn_id,
+                        "policy_decision",
+                        {"tool": tc.name, "decision": "deny",
+                         "reason": "auto-denied: identical action already denied by user"},
+                        parent_id=root,
+                    )
+                    result_text = (
+                        "DENIED (auto): the user already denied this exact action in this "
+                        "turn. Do not propose it again — explain the situation instead."
+                    )
+                    yield StreamEvent(
+                        "action_result", {"tool": tc.name, "ok": False, "output": result_text}
+                    )
+                    messages.append(
+                        ChatMessage(role="tool_result", text=result_text, tool_call_id=tc.id)
+                    )
+                    if auto_denies >= 2:
+                        yield StreamEvent(
+                            "error",
+                            {"message": "model kept retrying a denied action; turn stopped"},
+                        )
+                        return
+                    continue
+
                 req = ActionRequest(
                     tool=tc.name,
                     args=tc.arguments,
@@ -169,6 +209,8 @@ class Orchestrator:
                     self._policy.record_user_decision(req, approved)
                     if approved and scope == "session":
                         self._policy.grant_session(req)
+                    if not approved:
+                        denied_signatures.add(sig)
                     self._traces.span(
                         turn_id,
                         "approval",

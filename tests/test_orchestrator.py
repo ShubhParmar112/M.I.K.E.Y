@@ -116,6 +116,71 @@ async def test_denied_action_is_not_executed(env) -> None:
     assert EventType.ACTION_EXECUTED.value not in [e.type for e in events.recent()]
 
 
+async def test_retry_of_denied_action_is_auto_denied_without_reasking(env) -> None:
+    """Reproduces the live Gen 1 incident: model retries the exact action the
+    user just denied. The system must auto-deny without showing a second
+    approval card, and stop the turn if the model keeps insisting."""
+    config, db = env
+    write = ToolCall(id=ulid(), name="fs_write",
+                     arguments={"path": "hello.txt", "content": "Hello, World!"})
+    script = [
+        ModelResponse(text="", tool_calls=[write]),                      # user denies
+        ModelResponse(text="", tool_calls=[
+            ToolCall(id=ulid(), name="fs_write", arguments=dict(write.arguments))
+        ]),                                                              # retry -> auto-deny
+        ModelResponse(text="Understood — I won't write the file.", tool_calls=[]),
+    ]
+    orch, events, _traces, policy, approvals, executor = _orchestrator(config, db, script)
+
+    approval_requests = 0
+    auto_denied = 0
+    finals = []
+    try:
+        async for ev in orch.run_turn("s1", "write a greeting file"):
+            if ev.kind == "approval_request":
+                approval_requests += 1
+                approvals.resolve(ev.data["approval_id"], approved=False, scope="once")
+            if ev.kind == "action_result" and "DENIED (auto)" in ev.data["output"]:
+                auto_denied += 1
+            if ev.kind == "final":
+                finals.append(ev.data["text"])
+    finally:
+        await executor.close()
+
+    assert approval_requests == 1  # the user is never asked twice for the same denial
+    assert auto_denied == 1
+    assert finals == ["Understood — I won't write the file."]
+    assert not (config.workspace / "hello.txt").exists()
+    assert policy.verify_audit_chain() is True
+
+
+async def test_persistent_retry_stops_the_turn(env) -> None:
+    config, db = env
+    def write() -> ToolCall:
+        return ToolCall(id=ulid(), name="fs_write",
+                        arguments={"path": "hello.txt", "content": "Hello, World!"})
+    script = [
+        ModelResponse(text="", tool_calls=[write()]),
+        ModelResponse(text="", tool_calls=[write()]),
+        ModelResponse(text="", tool_calls=[write()]),
+        ModelResponse(text="should never be reached", tool_calls=[]),
+    ]
+    orch, _events, _traces, _policy, approvals, executor = _orchestrator(config, db, script)
+
+    kinds = []
+    try:
+        async for ev in orch.run_turn("s1", "write it"):
+            kinds.append(ev.kind)
+            if ev.kind == "approval_request":
+                approvals.resolve(ev.data["approval_id"], approved=False, scope="once")
+    finally:
+        await executor.close()
+
+    assert kinds[-1] == "error"  # turn stopped, model never got its "final" say
+    assert "final" not in kinds
+    assert not (config.workspace / "hello.txt").exists()
+
+
 async def test_plain_answer_no_tools(env) -> None:
     config, db = env
     script = [ModelResponse(text="2 + 2 = 4", tool_calls=[])]

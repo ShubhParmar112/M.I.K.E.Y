@@ -75,6 +75,9 @@ class PolicyEngine:
         self._session_grants.setdefault(req.session_id, set()).add(self._signature(req))
         self._audit("user", req, "session_grant", "user granted for session")
 
+    def record_auto_denial(self, req: ActionRequest) -> None:
+        self._audit("policy", req, "deny", "auto-denied: repeat of user-denied action")
+
     def record_user_decision(self, req: ActionRequest, approved: bool) -> None:
         self._audit("user", req, "approved" if approved else "denied", "explicit user decision")
 
