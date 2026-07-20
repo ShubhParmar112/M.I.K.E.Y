@@ -6,6 +6,8 @@ Binds to localhost only in Gen 1.
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -39,6 +41,19 @@ def _make_adapter(config: Config) -> ModelAdapter:
     return FakeAdapter()
 
 
+def _build_id() -> str:
+    """Short git hash of the running code, so a stale gateway is identifiable."""
+    try:
+        root = Path(__file__).resolve().parents[2]
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 class TurnRequest(BaseModel):
     session_id: str = "default"
     input: str
@@ -62,6 +77,7 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
 
     app = FastAPI(title="M.I.K.E.Y Gateway", version="0.1.0")
     app.state.policy = policy
+    build = _build_id()
 
     @app.post("/v1/turns")
     async def run_turn(req: TurnRequest) -> StreamingResponse:
@@ -98,6 +114,7 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
         return {
             "ok": True,
             "provider": gateway.provider,
+            "build": build,
             "audit_chain_valid": policy.verify_audit_chain(),
         }
 

@@ -88,6 +88,7 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
     console.print(
         Panel(
             f"provider: [bold]{health['provider']}[/bold] · "
+            f"build: {health.get('build', '?')} · "
             f"audit chain: {'[green]valid[/green]' if health['audit_chain_valid'] else '[red]BROKEN[/red]'} · "
             f"workspace: {CONFIG.workspace}",
             title="M.I.K.E.Y",
