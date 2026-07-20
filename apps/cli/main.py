@@ -33,6 +33,27 @@ def _server_running() -> bool:
         return False
 
 
+def _warn_if_stale() -> None:
+    """A reused gateway may be running older code than this CLI — say so loudly."""
+    from core.gateway.app import build_id
+
+    try:
+        running = httpx.get(f"{BASE}/v1/health", timeout=2.0).json().get("build", "?")
+    except httpx.HTTPError:
+        return
+    local = build_id()
+    if running != local:
+        console.print(
+            Panel(
+                f"gateway is running build [bold]{running}[/bold] but your code is "
+                f"[bold]{local}[/bold].\nQuit any open 'mikey chat' windows and rerun "
+                "so the gateway restarts on current code.",
+                title="STALE GATEWAY",
+                border_style="red",
+            )
+        )
+
+
 def _start_server_in_thread() -> None:
     from core.gateway.app import create_app
 
@@ -52,6 +73,8 @@ def _ensure_server() -> None:
     if not _server_running():
         console.print("[dim]starting local gateway…[/dim]")
         _start_server_in_thread()
+    else:
+        _warn_if_stale()
 
 
 @app.command()
@@ -193,9 +216,11 @@ def ingest(path: str) -> None:
 def recall(query: str, k: int = 6) -> None:
     """Search memory; results carry source, date, and trust level."""
     _ensure_server()
-    hits = httpx.post(f"{BASE}/v1/memory/query", json={"q": query, "k": k}, timeout=30.0).json()[
-        "hits"
-    ]
+    data = httpx.post(f"{BASE}/v1/memory/query", json={"q": query, "k": k}, timeout=30.0).json()
+    if "hits" not in data:
+        console.print(f"[red]server error:[/red] {data} — is the gateway on an old build?")
+        return
+    hits = data["hits"]
     if not hits:
         console.print("[dim]no memories matched[/dim]")
         return

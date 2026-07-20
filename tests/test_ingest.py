@@ -33,6 +33,27 @@ def test_ingest_directory_marks_untrusted_and_is_recallable(
     assert hits[0].source == "connector:file:notes.md"
 
 
+def test_ingest_pdf_extracts_text_and_is_recallable(db: Database, tmp_path: Path) -> None:
+    import pymupdf
+
+    pdf_path = tmp_path / "paper.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_text(
+        (72, 72), "Abstract: We study retrieval augmented memory for personal agents."
+    )
+    doc.save(pdf_path)
+    doc.close()
+
+    memory = MemoryStore(db, EventStore(db))
+    report = FileIngestor(memory, "dev_test").ingest_path(pdf_path)
+    assert report["ok"] and report["files_ingested"] == 1
+
+    hits = memory.recall("retrieval augmented memory")
+    assert hits and hits[0].source == "connector:file:paper.pdf"
+    assert hits[0].trusted is False
+
+
 def test_ingest_missing_path_reports_error(db: Database, tmp_path: Path) -> None:
     memory = MemoryStore(db, EventStore(db))
     report = FileIngestor(memory, "dev_test").ingest_path(tmp_path / "nope")

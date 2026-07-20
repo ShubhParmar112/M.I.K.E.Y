@@ -43,7 +43,7 @@ def _make_adapter(config: Config) -> ModelAdapter:
     return FakeAdapter()
 
 
-def _build_id() -> str:
+def build_id() -> str:
     """Short git hash of the running code, so a stale gateway is identifiable."""
     try:
         root = Path(__file__).resolve().parents[2]
@@ -81,7 +81,7 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
 
     app = FastAPI(title="M.I.K.E.Y Gateway", version="0.1.0")
     app.state.policy = policy
-    build = _build_id()
+    build = build_id()
 
     @app.post("/v1/turns")
     async def run_turn(req: TurnRequest) -> StreamingResponse:

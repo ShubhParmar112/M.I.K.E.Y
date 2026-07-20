@@ -14,8 +14,18 @@ from core.events.schema import Event, EventType, Provenance, Tier
 from core.memory.store import MemoryStore
 
 TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".py", ".json", ".toml", ".yaml", ".yml", ".csv"}
-MAX_FILE_BYTES = 2_000_000
+PDF_EXTENSION = ".pdf"
+MAX_FILE_BYTES = 50_000_000
 CHUNK_CHARS = 1_500
+
+
+def extract_pdf_text(path: Path) -> str:
+    """Plain-text extraction, page by page. Scanned PDFs (no text layer) come
+    back empty — OCR is a later Gen 2 slice."""
+    import pymupdf
+
+    with pymupdf.open(path) as doc:
+        return "\n\n".join(page.get_text() for page in doc)
 
 
 def chunk_text(text: str, chunk_chars: int = CHUNK_CHARS) -> list[str]:
@@ -53,13 +63,24 @@ class FileIngestor:
         skipped: list[str] = []
         chunks_total = 0
         for f in files:
-            if f.suffix.lower() not in TEXT_EXTENSIONS:
+            suffix = f.suffix.lower()
+            if suffix not in TEXT_EXTENSIONS and suffix != PDF_EXTENSION:
                 skipped.append(f.name)
                 continue
             if f.stat().st_size > MAX_FILE_BYTES:
                 skipped.append(f"{f.name} (too large)")
                 continue
-            text = f.read_text(encoding="utf-8", errors="replace")
+            if suffix == PDF_EXTENSION:
+                try:
+                    text = extract_pdf_text(f)
+                except Exception as exc:
+                    skipped.append(f"{f.name} (pdf error: {exc})")
+                    continue
+                if not text.strip():
+                    skipped.append(f"{f.name} (no text layer — scanned PDF? OCR comes later)")
+                    continue
+            else:
+                text = f.read_text(encoding="utf-8", errors="replace")
             chunks = chunk_text(text)
             for i, chunk in enumerate(chunks):
                 self._memory.record(
