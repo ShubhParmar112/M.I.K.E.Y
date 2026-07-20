@@ -34,6 +34,29 @@ def _mock(response_body: dict[str, Any], captured: dict[str, Any]) -> httpx.Mock
     return httpx.MockTransport(handler)
 
 
+TOOL_USE_FAILED = {
+    "error": {
+        "code": "tool_use_failed",
+        "message": "Failed to call a function.",
+        "failed_generation": '<function=fs_read[]{"path": "C:\\\\hosts"}</function>',
+    }
+}
+
+
+def _flaky(fail_times: int, requests: list[dict[str, Any]]) -> httpx.MockTransport:
+    """400/tool_use_failed for the first `fail_times` calls, then 200."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) <= fail_times:
+            return httpx.Response(400, json=TOOL_USE_FAILED)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "recovered"}}], "usage": {}}
+        )
+
+    return httpx.MockTransport(handler)
+
+
 async def test_request_translation_and_tool_call_parsing() -> None:
     captured: dict[str, Any] = {}
     adapter = GroqAdapter(
@@ -102,3 +125,33 @@ async def test_tool_result_roundtrip_and_text_response() -> None:
     assert wire[3] == {"role": "tool", "tool_call_id": "call_1", "content": "hi"}
     assert resp.text == "The file says hi."
     assert resp.tool_calls == []
+
+
+async def test_tool_use_failed_is_retried() -> None:
+    requests: list[dict[str, Any]] = []
+    adapter = GroqAdapter(model="m", api_key="k", transport=_flaky(1, requests))
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="hi")], TOOLS)
+    assert resp.text == "recovered"
+    assert len(requests) == 2
+    assert requests[1]["tool_choice"] == "auto"  # plain retry first
+
+
+async def test_final_retry_degrades_to_text_only() -> None:
+    requests: list[dict[str, Any]] = []
+    adapter = GroqAdapter(model="m", api_key="k", transport=_flaky(2, requests))
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="hi")], TOOLS)
+    assert resp.text == "recovered"
+    assert len(requests) == 3
+    assert requests[2]["tool_choice"] == "none"  # graceful degradation to text
+
+
+async def test_persistent_tool_use_failure_raises_with_detail() -> None:
+    requests: list[dict[str, Any]] = []
+    adapter = GroqAdapter(model="m", api_key="k", transport=_flaky(99, requests))
+    try:
+        await adapter.complete("sys", [ChatMessage(role="user", text="hi")], TOOLS)
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as exc:
+        assert "tool_use_failed" in str(exc)
+        assert "fs_read" in str(exc)  # failed_generation surfaced for debugging
+    assert len(requests) == 3

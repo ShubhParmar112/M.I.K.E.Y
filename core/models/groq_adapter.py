@@ -60,7 +60,7 @@ class GroqAdapter:
                     {"role": "tool", "tool_call_id": m.tool_call_id, "content": m.text}
                 )
 
-        body: dict[str, Any] = {"model": self._model, "messages": wire}
+        body: dict[str, Any] = {"model": self._model, "messages": wire, "temperature": 0.2}
         if tools:
             body["tools"] = [
                 {
@@ -75,16 +75,40 @@ class GroqAdapter:
             ]
             body["tool_choice"] = "auto"
 
+        # Llama occasionally emits malformed tool-call syntax, which Groq rejects
+        # as 400/tool_use_failed. That's a transient generation failure, not a
+        # request error: retry, and on the last attempt force a text-only answer
+        # so the turn degrades gracefully instead of dying (failure taxonomy M12).
         async with httpx.AsyncClient(
             timeout=120.0, transport=self._transport
         ) as client:
-            resp = await client.post(
-                f"{BASE_URL}/chat/completions",
-                headers={"Authorization": f"Bearer {self._api_key}"},
-                json=body,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            last_failed_generation = ""
+            for attempt in range(3):
+                attempt_body = dict(body)
+                if attempt == 2 and "tools" in body:
+                    attempt_body["tool_choice"] = "none"
+                resp = await client.post(
+                    f"{BASE_URL}/chat/completions",
+                    headers={"Authorization": f"Bearer {self._api_key}"},
+                    json=attempt_body,
+                )
+                if resp.status_code == 400:
+                    try:
+                        err = resp.json().get("error", {})
+                    except ValueError:
+                        err = {}
+                    if err.get("code") == "tool_use_failed":
+                        last_failed_generation = str(err.get("failed_generation", ""))[:300]
+                        continue
+                    raise RuntimeError(f"groq 400: {err.get('message', resp.text[:300])}")
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            else:
+                raise RuntimeError(
+                    "groq: model repeatedly produced malformed tool calls "
+                    f"(tool_use_failed); last generation: {last_failed_generation!r}"
+                )
 
         message = data["choices"][0]["message"]
         tool_calls = [
