@@ -7,6 +7,8 @@ session with live approval cards. `mikey trace` answers "why did you do that?".
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 import time
 from typing import Any
@@ -136,29 +138,35 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
                     console.print("[dim]no turn yet[/dim]")
                 continue
 
-            with client.stream(
-                "POST", f"{BASE}/v1/turns", json={"session_id": session, "input": user_input}
-            ) as resp:
-                for line in resp.iter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    ev = json.loads(line[6:])
-                    kind = ev["kind"]
-                    if kind == "status":
-                        last_turn = ev["turn_id"]
-                    elif kind == "action":
-                        console.print(
-                            f"[dim]→ {ev['tool']} {json.dumps(ev['args'], ensure_ascii=False)[:120]}[/dim]"
-                        )
-                    elif kind == "approval_request":
-                        _handle_approval(client, ev)
-                    elif kind == "action_result":
-                        mark = "[green]ok[/green]" if ev["ok"] else "[red]failed[/red]"
-                        console.print(f"[dim]← {ev['tool']} {mark}[/dim]")
-                    elif kind == "final":
-                        console.print(Panel(ev["text"], border_style="cyan", title="mikey"))
-                    elif kind == "error":
-                        console.print(f"[red]error:[/red] {ev['message']}")
+            try:
+                with client.stream(
+                    "POST", f"{BASE}/v1/turns", json={"session_id": session, "input": user_input}
+                ) as resp:
+                    for line in resp.iter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        ev = json.loads(line[6:])
+                        kind = ev["kind"]
+                        if kind == "status":
+                            last_turn = ev["turn_id"]
+                        elif kind == "action":
+                            console.print(
+                                f"[dim]→ {ev['tool']} {json.dumps(ev['args'], ensure_ascii=False)[:120]}[/dim]"
+                            )
+                        elif kind == "approval_request":
+                            _handle_approval(client, ev)
+                        elif kind == "action_result":
+                            mark = "[green]ok[/green]" if ev["ok"] else "[red]failed[/red]"
+                            console.print(f"[dim]← {ev['tool']} {mark}[/dim]")
+                        elif kind == "final":
+                            console.print(Panel(ev["text"], border_style="cyan", title="mikey"))
+                        elif kind == "error":
+                            console.print(f"[red]error:[/red] {ev['message']}")
+            except httpx.HTTPError as exc:
+                console.print(
+                    f"[red]turn aborted:[/red] {type(exc).__name__}: {exc} — "
+                    "the gateway may have restarted; try again"
+                )
 
 
 def _print_trace(turn_id: str) -> None:
@@ -255,6 +263,13 @@ def reindex() -> None:
 
 
 def main() -> None:
+    if os.environ.get("MIKEY_SANDBOXED") == "1":
+        # Running inside M.I.K.E.Y's own executor sandbox: refuse recursion.
+        print(
+            "mikey cannot run inside mikey's sandbox. "
+            "Run this command in your own terminal (the PS> prompt, not you>)."
+        )
+        sys.exit(1)
     app()
 
 

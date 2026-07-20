@@ -33,6 +33,32 @@ def test_command_allowlist_enforced(tmp_path: Path) -> None:
     assert r.ok and "ok" in r.output
 
 
+def test_drive_letter_paths_denied_everywhere(tmp_path: Path) -> None:
+    """C:\\-style paths must be escape attempts on every OS — on Linux they are
+    otherwise legal filenames, which is how this suite broke CI on ubuntu."""
+    tools = Tools(tmp_path / "ws")
+    r = tools.call("fs_read", {"path": "D:\\data\\secrets.txt"})
+    assert not r.ok and "capability violation" in r.output
+
+
+def test_command_timeout_kills_process_tree(tmp_path: Path, monkeypatch) -> None:
+    import executor.tools as et
+
+    monkeypatch.setattr(et, "COMMAND_TIMEOUT_S", 1)
+    tools = Tools(tmp_path)
+    r = tools.call("run_command", {"command": ["python", "-c", "import time; time.sleep(60)"]})
+    assert not r.ok and "timed out" in r.output and "killed" in r.output
+
+
+def test_run_command_children_are_marked_sandboxed(tmp_path: Path) -> None:
+    tools = Tools(tmp_path)
+    r = tools.call(
+        "run_command",
+        {"command": ["python", "-c", "import os; print(os.environ.get('MIKEY_SANDBOXED'))"]},
+    )
+    assert r.ok and r.output.strip() == "1"
+
+
 def test_web_fetch_rejects_non_http(tmp_path: Path) -> None:
     tools = Tools(tmp_path)
     r = tools.call("web_fetch", {"url": "file:///C:/Windows/system.ini"})

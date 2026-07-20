@@ -29,8 +29,11 @@ def serve(workspace: Path) -> None:
             }
         except Exception as exc:  # never crash the sandbox loop on a bad request
             resp = {"id": None, "error": str(exc)}
-        sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+        except OSError:
+            return  # parent is gone; exit quietly instead of a zombie traceback
 
 
 def main() -> None:

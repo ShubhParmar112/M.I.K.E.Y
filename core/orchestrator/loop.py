@@ -16,7 +16,7 @@ from typing import Any, AsyncIterator
 from core.config import Config
 from core.context.assembly import ContextAssembler
 from core.events.schema import Event, EventType, Provenance, ulid
-from core.executor_client import ExecutorClient
+from core.executor_client import ExecResult, ExecutorClient
 from core.memory.store import MemoryStore
 from core.models.gateway import ChatMessage, ModelGateway
 from core.orchestrator.tools import TOOLS
@@ -236,7 +236,12 @@ class Orchestrator:
                     )
                     ok = False
                 else:
-                    result = await self._executor.call(tc.name, tc.arguments)
+                    try:
+                        result = await self._executor.call(tc.name, tc.arguments)
+                    except Exception as exc:
+                        # An executor failure must degrade the ACTION, never
+                        # crash the turn or the client's stream.
+                        result = ExecResult(False, f"executor failure: {exc}", False)
                     ok = result.ok
                     result_text = result.output
                     if result.tainted:

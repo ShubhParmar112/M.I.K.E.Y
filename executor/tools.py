@@ -7,6 +7,8 @@ here, inside the sandbox process, regardless of what the core asked for.
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,9 +40,16 @@ class Tools:
     # ---- confinement ----
 
     def _confine(self, raw: str) -> Path:
-        candidate = (self._workspace / raw).resolve() if not Path(raw).is_absolute() else Path(
-            raw
-        ).resolve()
+        # Windows-style separators and drive letters are treated as path syntax
+        # on EVERY platform: "..\x" or "C:\x" must be an escape attempt on Linux
+        # too, never a quirky filename inside the workspace.
+        norm = raw.replace("\\", "/")
+        if os.name != "nt" and re.match(r"^[A-Za-z]:($|/)", norm):
+            raise CapabilityError(f"path escapes workspace: {raw}")
+        candidate = Path(norm)
+        candidate = (
+            candidate.resolve() if candidate.is_absolute() else (self._workspace / norm).resolve()
+        )
         if candidate != self._workspace and self._workspace not in candidate.parents:
             raise CapabilityError(f"path escapes workspace: {raw}")
         return candidate
@@ -76,21 +85,45 @@ class Tools:
         binary = Path(command[0]).name.lower().removesuffix(".exe")
         if binary not in COMMAND_ALLOWLIST:
             raise CapabilityError(f"binary '{binary}' not in allowlist {sorted(COMMAND_ALLOWLIST)}")
+        env = dict(os.environ, MIKEY_SANDBOXED="1")  # so mikey refuses to nest itself
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 cwd=self._workspace,
-                capture_output=True,
+                stdin=subprocess.DEVNULL,  # interactive children get EOF, not a hang
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=COMMAND_TIMEOUT_S,
                 shell=False,
+                env=env,
             )
-        except subprocess.TimeoutExpired:
-            return ToolResult(False, f"command timed out after {COMMAND_TIMEOUT_S}s")
         except FileNotFoundError:
             return ToolResult(False, f"binary not found: {command[0]}")
-        out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+        try:
+            stdout, stderr = proc.communicate(timeout=COMMAND_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            self._kill_tree(proc)
+            return ToolResult(
+                False, f"command timed out after {COMMAND_TIMEOUT_S}s (process tree killed)"
+            )
+        out = (stdout or "") + (("\n" + stderr) if stderr else "")
         return ToolResult(proc.returncode == 0, out.strip() or f"(exit {proc.returncode})")
+
+    @staticmethod
+    def _kill_tree(proc: subprocess.Popen[str]) -> None:
+        """Kill the child AND its descendants — on Windows, grandchildren keep
+        pipes open and hang communicate() long past the timeout otherwise."""
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                    capture_output=True, timeout=10,
+                )
+            else:
+                proc.kill()
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
 
     def web_fetch(self, url: str) -> ToolResult:
         if not url.lower().startswith(("http://", "https://")):

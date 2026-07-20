@@ -50,7 +50,17 @@ class ExecutorClient:
             }
             proc.stdin.write((json.dumps(req, ensure_ascii=False) + "\n").encode())
             await proc.stdin.drain()
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=120.0)
+            try:
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout=120.0)
+            except TimeoutError:
+                # The sandbox is wedged (e.g. a child holding pipes). A stuck
+                # executor can never be reused — responses would desync. Kill it;
+                # the next call spawns a fresh one.
+                await self._kill()
+                return ExecResult(
+                    False, "executor timed out and was restarted; the action did not complete",
+                    False,
+                )
             if not line:
                 self._proc = None
                 return ExecResult(False, "executor process died", False)
@@ -59,6 +69,15 @@ class ExecutorClient:
                 return ExecResult(False, f"executor error: {resp['error']}", False)
             r = resp["result"]
             return ExecResult(bool(r["ok"]), str(r["output"]), bool(r.get("tainted", False)))
+
+    async def _kill(self) -> None:
+        if self._proc is not None and self._proc.returncode is None:
+            self._proc.kill()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=5.0)
+            except TimeoutError:
+                pass
+        self._proc = None
 
     async def close(self) -> None:
         if self._proc is not None and self._proc.returncode is None:
