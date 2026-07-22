@@ -14,9 +14,19 @@ from core.events.schema import ulid
 class OllamaAdapter:
     name = "ollama"
 
-    def __init__(self, base_url: str, model: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+        keep_alive: str = "30m",
+        num_predict: int = 512,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
+        self._transport = transport  # injectable for tests
+        self._keep_alive = keep_alive  # keep the model resident: no ~77s cold reloads
+        self._num_predict = num_predict  # cap the reply so a local turn stays snappy
 
     async def complete(
         self,
@@ -39,7 +49,13 @@ class OllamaAdapter:
             elif m.role == "tool_result":
                 wire.append({"role": "tool", "content": m.text})
 
-        body: dict[str, Any] = {"model": self._model, "messages": wire, "stream": False}
+        body: dict[str, Any] = {
+            "model": self._model,
+            "messages": wire,
+            "stream": False,
+            "keep_alive": self._keep_alive,
+            "options": {"num_predict": self._num_predict},
+        }
         if tools:
             body["tools"] = [
                 {
@@ -53,7 +69,7 @@ class OllamaAdapter:
                 for t in tools
             ]
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        async with httpx.AsyncClient(timeout=300.0, transport=self._transport) as client:
             try:
                 resp = await client.post(f"{self._base_url}/api/chat", json=body)
             except httpx.TransportError as exc:
