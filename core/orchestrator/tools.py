@@ -80,14 +80,38 @@ TOOLS: list[dict[str, Any]] = [
             "Persist a durable fact so you can recall it in future conversations. "
             "Use this when the user asks you to remember something, or states a "
             "lasting preference or fact worth keeping. Store one clear, self-contained "
-            "fact per call — write it so it still makes sense with no surrounding context."
+            "fact per call — write it so it still makes sense with no surrounding context. "
+            "Near-duplicate facts are skipped automatically. If this fact CORRECTS or "
+            "REPLACES an earlier one (e.g. an updated number), first memory_recall to get "
+            "the old memory's id, then pass it in `supersedes` so the stale fact is retired."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "the fact to remember"},
+                "supersedes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "ids of earlier memories this fact replaces (optional)",
+                },
             },
             "required": ["text"],
+        },
+    },
+    {
+        "name": "memory_forget",
+        "description": (
+            "Permanently forget a specific memory by its id (get the id from "
+            "memory_recall). Use only when the user explicitly asks to forget or delete "
+            "something. This is verified deletion from every projection and requires user "
+            "approval."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "the memory id to forget"},
+            },
+            "required": ["event_id"],
         },
     },
 ]

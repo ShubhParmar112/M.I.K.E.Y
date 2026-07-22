@@ -6,6 +6,7 @@ tier. Privacy-wise it is a cloud provider like Anthropic, not a local runtime.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from core.events.schema import ulid
 from core.models.gateway import ChatMessage, ModelResponse, ModelUnavailable, ToolCall
 
 BASE_URL = "https://api.groq.com/openai/v1"
+MAX_RATE_LIMIT_BACKOFF_S = 4.0  # cap the wait so we still fall back promptly
 
 # Llama on Groq sometimes emits a tool call as literal text inside the message
 # content — `<function=name>{json args}</function>` — instead of a structured
@@ -61,10 +63,14 @@ class GroqAdapter:
         model: str,
         api_key: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        rate_limit_retries: int = 2,
+        rate_limit_backoff_s: float = 1.5,
     ) -> None:
         self._model = model
         self._api_key = api_key or os.environ.get("GROQ_API_KEY", "")
         self._transport = transport  # injectable for tests
+        self._rl_retries = rate_limit_retries
+        self._rl_backoff = rate_limit_backoff_s
 
     async def complete(
         self,
@@ -123,20 +129,32 @@ class GroqAdapter:
                 attempt_body = dict(body)
                 if attempt == 2 and "tools" in body:
                     attempt_body["tool_choice"] = "none"
-                try:
-                    resp = await client.post(
-                        f"{BASE_URL}/chat/completions",
-                        headers={"Authorization": f"Bearer {self._api_key}"},
-                        json=attempt_body,
-                    )
-                except httpx.TransportError as exc:
-                    # DNS/connect/timeout ~ offline or Groq unreachable. A local
-                    # fallback can still answer, so signal it rather than dying.
-                    raise ModelUnavailable(
-                        "groq", f"unreachable ({type(exc).__name__})"
-                    ) from exc
-                # Rate limit and server errors are exactly what the local fallback
-                # exists for; auth/other 4xx are not (falling back hides a real bug).
+                # Post, with a short backoff on 429 before conceding to the
+                # fallback: a per-minute spike usually clears in a second or two,
+                # which beats dropping onto a much slower local model.
+                for rl in range(self._rl_retries + 1):
+                    try:
+                        resp = await client.post(
+                            f"{BASE_URL}/chat/completions",
+                            headers={"Authorization": f"Bearer {self._api_key}"},
+                            json=attempt_body,
+                        )
+                    except httpx.TransportError as exc:
+                        # DNS/connect/timeout ~ offline or Groq unreachable. A local
+                        # fallback can still answer, so signal it rather than dying.
+                        raise ModelUnavailable(
+                            "groq", f"unreachable ({type(exc).__name__})"
+                        ) from exc
+                    if resp.status_code == 429 and rl < self._rl_retries:
+                        delay = min(
+                            _retry_after(resp) or self._rl_backoff * (rl + 1),
+                            MAX_RATE_LIMIT_BACKOFF_S,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    break
+                # Rate limit (after backoff) and server errors are what the local
+                # fallback exists for; auth/other 4xx are not (that hides a real bug).
                 if resp.status_code == 429:
                     raise ModelUnavailable(
                         "groq", "rate limited (429)", retry_after=_retry_after(resp)

@@ -100,11 +100,33 @@ async def test_groq_429_becomes_unavailable_with_retry_after() -> None:
         return httpx.Response(429, headers={"retry-after": "12"},
                               json={"error": {"message": "rate limit"}})
 
-    adapter = GroqAdapter("m", api_key="k", transport=httpx.MockTransport(handler))
+    # retries=0: a persistent 429 concedes to the fallback immediately (no sleep)
+    adapter = GroqAdapter("m", api_key="k", rate_limit_retries=0,
+                          transport=httpx.MockTransport(handler))
     with pytest.raises(ModelUnavailable) as ei:
         await adapter.complete("", _msgs(), [])
     assert ei.value.retry_after == 12.0
     assert "429" in ei.value.reason
+
+
+async def test_groq_retries_transient_429_then_succeeds() -> None:
+    """A brief per-minute spike should be ridden out on the fast model, not
+    dumped onto the slow local fallback."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, json={"error": {"message": "slow down"}})
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "recovered"}}], "usage": {}}
+        )
+
+    adapter = GroqAdapter("m", api_key="k", rate_limit_backoff_s=0.0,
+                          transport=httpx.MockTransport(handler))
+    resp = await adapter.complete("", _msgs(), [])
+    assert resp.text == "recovered"
+    assert calls["n"] == 2  # one 429, one success — no fallback needed
 
 
 async def test_groq_offline_becomes_unavailable() -> None:

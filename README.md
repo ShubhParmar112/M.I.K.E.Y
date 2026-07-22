@@ -51,6 +51,8 @@ Data lives in `~/.mikey/` (event log, audit chain, traces); the agent's sandbox 
 
 M.I.K.E.Y also reaches its memory *during* a conversation: `memory_recall` searches long-term memory on demand (not just the handful pre-loaded each turn) and `memory_remember` persists a durable fact when you ask it to — so "remember my dog is named Pixel" now sticks, and "what's my dog's name?" later retrieves it with provenance. Recalling an untrusted memory taints the turn just like ingested files do.
 
+Remembered facts are kept clean: a near-duplicate is skipped, a correction can `supersede` (tombstone) the stale fact it replaces, and a related-but-conflicting memory is flagged so it gets reconciled rather than silently doubling up. `memory_forget` lets M.I.K.E.Y drop a specific memory on request — a verified deletion from every projection, gated behind an approval card because it's destructive.
+
 ## Gen 1 status
 
 | Component | State |

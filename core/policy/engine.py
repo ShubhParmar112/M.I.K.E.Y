@@ -51,6 +51,8 @@ RULES: dict[str, Decision] = {
     # auto-allows on a clean turn — but a tainted turn escalates it to ASK below,
     # closing the memory-poisoning channel where untrusted content plants a "fact".
     "memory_remember": Decision.ALLOW,
+    # Forgetting is destructive and irreversible: always confirm with the user.
+    "memory_forget": Decision.ASK,
 }
 
 

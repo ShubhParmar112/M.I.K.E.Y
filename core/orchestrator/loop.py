@@ -27,7 +27,7 @@ MAX_STEPS = 12  # hard stop against runaway loops (review M8's tiny Gen 1 cousin
 
 # Memory tools run in-process against the projection, not in the sandboxed
 # executor: they read/write M.I.K.E.Y's own state, never the outside world.
-MEMORY_TOOLS = {"memory_recall", "memory_remember"}
+MEMORY_TOOLS = {"memory_recall", "memory_remember", "memory_forget"}
 MEMORY_SNIPPET_CHARS = 700
 
 
@@ -142,7 +142,11 @@ class Orchestrator:
                         payload={"text": resp.text, "session_id": session_id, "turn_id": turn_id},
                     )
                 )
-                yield StreamEvent("final", {"text": resp.text, "turn_id": turn_id})
+                yield StreamEvent(
+                    "final",
+                    {"text": resp.text, "turn_id": turn_id,
+                     "served_by": self._gateway.last_provider},
+                )
                 return
 
             messages.append(
@@ -150,7 +154,11 @@ class Orchestrator:
             )
 
             for tc in resp.tool_calls:
-                yield StreamEvent("action", {"tool": tc.name, "args": tc.arguments})
+                yield StreamEvent(
+                    "action",
+                    {"tool": tc.name, "args": tc.arguments,
+                     "served_by": self._gateway.last_provider},
+                )
 
                 # The user's denial is enforced by the system, not by the model's
                 # obedience: an identical re-proposal never reaches the user again.
@@ -326,20 +334,38 @@ class Orchestrator:
             text = str(args.get("text", "")).strip()
             if not text:
                 return ExecResult(False, "memory_remember requires 'text'.", False)
-            ev = self._memory.record(
-                Event(
-                    type=EventType.MEMORY_NOTE.value,
-                    device=self._config.device_id,
-                    provenance=Provenance(
-                        source="user" if not tainted else "agent",
-                        trusted=not tainted,
-                    ),
-                    payload={"text": text, "turn_id": turn_id},
+            raw = args.get("supersedes")
+            supersedes = [raw] if isinstance(raw, str) else raw if isinstance(raw, list) else None
+            result = self._memory.remember(
+                text,
+                source="user" if not tainted else "agent",
+                trusted=not tainted,
+                turn_id=turn_id,
+                device=self._config.device_id,
+                supersedes=[str(s) for s in supersedes] if supersedes else None,
+            )
+            if result.status == "duplicate":
+                return ExecResult(
+                    True, f"Already remembered that ({result.duplicate_of}); nothing to add.", False
                 )
-            )
-            return ExecResult(
-                True, f"Remembered (id {ev.id}); I'll recall this in future conversations.", False
-            )
+            msg = f"Remembered (id {result.event_id})."
+            if result.superseded:
+                msg += f" Replaced older memory: {', '.join(result.superseded)}."
+            if result.related:
+                msg += (
+                    " Possibly related or conflicting existing memories: "
+                    f"{', '.join(result.related)} — recall them if you need to reconcile."
+                )
+            return ExecResult(True, msg, False)
+
+        if name == "memory_forget":
+            event_id = str(args.get("event_id", "")).strip()
+            if not event_id:
+                return ExecResult(False, "memory_forget requires an 'event_id'.", False)
+            report = self._memory.forget(event_id, reason="user asked M.I.K.E.Y to forget it")
+            if report["verified"]:
+                return ExecResult(True, f"Forgotten and verified gone from memory ({event_id}).", False)
+            return ExecResult(False, f"Could not verify {event_id} was forgotten.", False)
 
         return ExecResult(False, f"unknown memory tool: {name}", False)
 

@@ -87,6 +87,19 @@ def serve() -> None:
     uvicorn.run(create_app(), host="127.0.0.1", port=CONFIG.port)
 
 
+def _served_tag(ev: dict[str, Any], primary: str) -> str:
+    """Mark an event that a non-primary (local fallback) model produced."""
+    served = ev.get("served_by")
+    return f" [yellow](via {served})[/yellow]" if served and served != primary else ""
+
+
+def _fallback_subtitle(ev: dict[str, Any], primary: str) -> str | None:
+    served = ev.get("served_by")
+    if served and served != primary:
+        return f"[yellow]on local model ({served}) — {primary} was rate-limited/offline[/yellow]"
+    return None
+
+
 def _handle_approval(client: httpx.Client, ev: dict[str, Any]) -> None:
     args = json.dumps(ev.get("args", {}), ensure_ascii=False)
     console.print(
@@ -110,6 +123,7 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
     """Interactive chat with approval cards."""
     _ensure_server()
     health = httpx.get(f"{BASE}/v1/health", timeout=5.0).json()
+    primary = health["provider"]
     fallback = health.get("fallback")
     provider_line = f"provider: [bold]{health['provider']}[/bold]"
     if fallback:
@@ -142,7 +156,13 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
                     console.print("[dim]no turn yet[/dim]")
                 continue
 
+            # A spinner so a slow turn (e.g. a cold local-model fallback) reads as
+            # "working", not "frozen". Ctrl+C here cancels the turn — closing the
+            # stream disconnects the client, which cancels the turn server-side —
+            # and drops back to the prompt instead of killing the whole session.
+            status = console.status("[dim]thinking…[/dim]", spinner="dots")
             try:
+                status.start()
                 with client.stream(
                     "POST", f"{BASE}/v1/turns", json={"session_id": session, "input": user_input}
                 ) as resp:
@@ -151,26 +171,37 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
                             continue
                         ev = json.loads(line[6:])
                         kind = ev["kind"]
+                        status.stop()
                         if kind == "status":
                             last_turn = ev["turn_id"]
                         elif kind == "action":
-                            console.print(
-                                f"[dim]→ {ev['tool']} {json.dumps(ev['args'], ensure_ascii=False)[:120]}[/dim]"
-                            )
+                            args = json.dumps(ev["args"], ensure_ascii=False)[:120]
+                            console.print(f"[dim]→ {ev['tool']} {args}[/dim]{_served_tag(ev, primary)}")
                         elif kind == "approval_request":
                             _handle_approval(client, ev)
                         elif kind == "action_result":
                             mark = "[green]ok[/green]" if ev["ok"] else "[red]failed[/red]"
                             console.print(f"[dim]← {ev['tool']} {mark}[/dim]")
                         elif kind == "final":
-                            console.print(Panel(ev["text"], border_style="cyan", title="mikey"))
+                            console.print(Panel(
+                                ev["text"], border_style="cyan", title="mikey",
+                                subtitle=_fallback_subtitle(ev, primary),
+                            ))
                         elif kind == "error":
                             console.print(f"[red]error:[/red] {ev['message']}")
+                        if kind not in ("final", "error"):
+                            status.start()  # resume the spinner while the turn continues
+            except KeyboardInterrupt:
+                console.print(
+                    "\n[dim](turn canceled — any in-flight action may still finish)[/dim]"
+                )
             except httpx.HTTPError as exc:
                 console.print(
                     f"[red]turn aborted:[/red] {type(exc).__name__}: {exc} — "
                     "the gateway may have restarted; try again"
                 )
+            finally:
+                status.stop()
 
 
 def _print_trace(turn_id: str) -> None:

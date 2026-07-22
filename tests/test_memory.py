@@ -50,6 +50,47 @@ def test_forget_is_verified_and_total(db: Database) -> None:
     assert memory.recall("launch code") == []
 
 
+def test_remember_stores_and_is_recallable(db: Database) -> None:
+    memory = _memory(db)
+    r = memory.remember("Shubh's dog is named Pixel.")
+    assert r.status == "stored"
+    hits = memory.recall("dog Pixel")
+    assert any(h.event_id == r.event_id for h in hits)
+
+
+def test_remember_skips_near_duplicate(db: Database) -> None:
+    memory = _memory(db)
+    first = memory.remember("Shubh's dog is named Pixel.")
+    dup = memory.remember("Shubh's dog is named Pixel.")  # same fact again
+    assert dup.status == "duplicate"
+    assert dup.duplicate_of == first.event_id
+    # only one copy actually persisted
+    assert len(memory.recent_notes()) == 1
+
+
+def test_remember_supersedes_tombstones_the_old_fact(db: Database) -> None:
+    memory = _memory(db)
+    old = memory.remember("Shubh has 2 years of industry experience.")
+    new = memory.remember(
+        "Shubh has 2.5 years of industry experience.", supersedes=[old.event_id]
+    )
+    assert new.status == "superseded"
+    assert new.superseded == [old.event_id]
+    # the stale fact is verifiably gone; the corrected one remains
+    ids = [n.id for n in memory.recent_notes()]
+    assert old.event_id not in ids and new.event_id in ids
+    assert all("2 years" not in h.text for h in memory.recall("industry experience"))
+
+
+def test_remember_flags_related_but_distinct_fact(db: Database) -> None:
+    memory = _memory(db)
+    first = memory.remember("Shubh has 2 years of industry experience in data science.")
+    # overlapping subject, different content — not a duplicate, worth flagging
+    second = memory.remember("Shubh has 2.5 years of industry experience in machine learning.")
+    assert second.status == "stored"
+    assert first.event_id in second.related
+
+
 def test_reindex_rebuilds_projection_from_log(db: Database) -> None:
     memory = _memory(db)
     memory.record(_doc("Fact one about quasar alignment."))
