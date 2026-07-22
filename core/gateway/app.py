@@ -43,6 +43,16 @@ def _make_adapter(config: Config) -> ModelAdapter:
     return FakeAdapter()
 
 
+def _make_fallback(config: Config) -> ModelAdapter | None:
+    """A local Ollama fallback when a cloud provider is primary. If the primary
+    is already local (ollama) or the offline path is disabled, there is none."""
+    if not config.local_fallback or config.provider not in ("groq", "anthropic"):
+        return None
+    from core.models.ollama_adapter import OllamaAdapter
+
+    return OllamaAdapter(config.ollama_base_url, config.fallback_ollama_model)
+
+
 def build_id() -> str:
     """Short git hash of the running code, so a stale gateway is identifiable."""
     try:
@@ -76,7 +86,12 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
     policy = PolicyEngine(db)
     approvals = ApprovalRegistry()
     executor = ExecutorClient(config.workspace)
-    gateway = ModelGateway(adapter or _make_adapter(config))
+    # A caller-supplied adapter (tests) runs solo; the real server gets the
+    # cloud→local hybrid so a rate limit or dropped connection isn't fatal.
+    if adapter is not None:
+        gateway = ModelGateway(adapter)
+    else:
+        gateway = ModelGateway(_make_adapter(config), fallback=_make_fallback(config))
     orch = Orchestrator(config, memory, traces, policy, gateway, executor, approvals)
 
     app = FastAPI(title="M.I.K.E.Y Gateway", version="0.1.0")
@@ -152,6 +167,7 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
         return {
             "ok": True,
             "provider": gateway.provider,
+            "fallback": gateway.fallback_provider,
             "build": build,
             "audit_chain_valid": policy.verify_audit_chain(),
         }

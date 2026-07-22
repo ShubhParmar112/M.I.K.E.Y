@@ -8,13 +8,49 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 import httpx
 
-from core.models.gateway import ChatMessage, ModelResponse, ToolCall
+from core.events.schema import ulid
+from core.models.gateway import ChatMessage, ModelResponse, ModelUnavailable, ToolCall
 
 BASE_URL = "https://api.groq.com/openai/v1"
+
+# Llama on Groq sometimes emits a tool call as literal text inside the message
+# content — `<function=name>{json args}</function>` — instead of a structured
+# tool_call. Left alone it shows up as garbage in the reply AND never executes.
+_INLINE_CALL_RE = re.compile(
+    r"<function=([A-Za-z0-9_]+)\s*>\s*(\{.*?\})\s*(?:</function>)?", re.DOTALL
+)
+
+
+def _parse_inline_tool_calls(content: str) -> tuple[str, list[ToolCall]]:
+    """Recover inline `<function=...>` calls from content and strip them from the
+    visible text. Malformed calls are dropped (not fired) but still stripped."""
+    calls: list[ToolCall] = []
+
+    def _take(m: re.Match[str]) -> str:
+        try:
+            args = json.loads(m.group(2))
+        except ValueError:
+            return ""
+        if isinstance(args, dict):
+            calls.append(ToolCall(id=ulid(), name=m.group(1), arguments=args))
+        return ""
+
+    return _INLINE_CALL_RE.sub(_take, content).strip(), calls
+
+
+def _retry_after(resp: httpx.Response) -> float | None:
+    raw = resp.headers.get("retry-after")
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 class GroqAdapter:
@@ -87,11 +123,26 @@ class GroqAdapter:
                 attempt_body = dict(body)
                 if attempt == 2 and "tools" in body:
                     attempt_body["tool_choice"] = "none"
-                resp = await client.post(
-                    f"{BASE_URL}/chat/completions",
-                    headers={"Authorization": f"Bearer {self._api_key}"},
-                    json=attempt_body,
-                )
+                try:
+                    resp = await client.post(
+                        f"{BASE_URL}/chat/completions",
+                        headers={"Authorization": f"Bearer {self._api_key}"},
+                        json=attempt_body,
+                    )
+                except httpx.TransportError as exc:
+                    # DNS/connect/timeout ~ offline or Groq unreachable. A local
+                    # fallback can still answer, so signal it rather than dying.
+                    raise ModelUnavailable(
+                        "groq", f"unreachable ({type(exc).__name__})"
+                    ) from exc
+                # Rate limit and server errors are exactly what the local fallback
+                # exists for; auth/other 4xx are not (falling back hides a real bug).
+                if resp.status_code == 429:
+                    raise ModelUnavailable(
+                        "groq", "rate limited (429)", retry_after=_retry_after(resp)
+                    )
+                if resp.status_code >= 500:
+                    raise ModelUnavailable("groq", f"server error ({resp.status_code})")
                 if resp.status_code == 400:
                     try:
                         err = resp.json().get("error", {})
@@ -111,6 +162,7 @@ class GroqAdapter:
                 )
 
         message = data["choices"][0]["message"]
+        content = message.get("content") or ""
         tool_calls = [
             ToolCall(
                 id=tc["id"],
@@ -119,9 +171,13 @@ class GroqAdapter:
             )
             for tc in message.get("tool_calls") or []
         ]
+        # Only reach for the text form when Groq gave us no structured calls —
+        # the structured field is authoritative when present.
+        if not tool_calls and "<function=" in content:
+            content, tool_calls = _parse_inline_tool_calls(content)
         usage = data.get("usage") or {}
         return ModelResponse(
-            text=message.get("content") or "",
+            text=content,
             tool_calls=tool_calls,
             usage={
                 "input_tokens": usage.get("prompt_tokens", 0),

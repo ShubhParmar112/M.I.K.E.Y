@@ -45,6 +45,7 @@ class EventType(StrEnum):
     ASSISTANT_MESSAGE = "conversation.message.assistant"
     ACTION_EXECUTED = "action.executed"
     INGEST_DOCUMENT = "ingest.document"
+    MEMORY_NOTE = "memory.note"  # a durable fact M.I.K.E.Y was asked to remember
 
 
 class Provenance(BaseModel):

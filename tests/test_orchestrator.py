@@ -230,6 +230,89 @@ async def test_untrusted_memory_is_injected_and_taints_the_turn(env) -> None:
     assert approval_for_read is True
 
 
+async def test_remember_then_recall_across_turns(env) -> None:
+    """The Jarvis loop: the user tells M.I.K.E.Y a fact, it persists it with
+    memory_remember (no approval — it only touches its own state), and a later
+    turn retrieves it with memory_recall instead of shelling out to the CLI."""
+    config, db = env
+    script = [
+        # turn 1: remember a durable fact
+        ModelResponse(text="", tool_calls=[
+            ToolCall(id=ulid(), name="memory_remember",
+                     arguments={"text": "The user's dog is named Pixel."})
+        ]),
+        ModelResponse(text="Got it — I'll remember that.", tool_calls=[]),
+        # turn 2: recall it
+        ModelResponse(text="", tool_calls=[
+            ToolCall(id=ulid(), name="memory_recall", arguments={"query": "dog name"})
+        ]),
+        ModelResponse(text="Your dog is named Pixel.", tool_calls=[]),
+    ]
+    orch, events, _traces, policy, approvals, executor = _orchestrator(config, db, script)
+
+    try:
+        approvals_asked = 0
+        async for ev in orch.run_turn("s1", "remember my dog is named Pixel"):
+            if ev.kind == "approval_request":
+                approvals_asked += 1
+        # remembering a fact on a clean turn is auto-allowed
+        assert approvals_asked == 0
+        assert EventType.MEMORY_NOTE.value in [e.type for e in events.recent()]
+
+        recall_output = ""
+        async for ev in orch.run_turn("s1", "what is my dog's name?"):
+            if ev.kind == "action_result" and ev.data["tool"] == "memory_recall":
+                recall_output = ev.data["output"]
+    finally:
+        await executor.close()
+
+    # the persisted fact came back through the recall tool, carrying provenance
+    assert "Pixel" in recall_output
+    assert "trusted" in recall_output
+    assert policy.verify_audit_chain() is True
+
+
+async def test_recall_of_untrusted_memory_taints_the_turn(env) -> None:
+    """memory_recall that surfaces an untrusted memory must taint the turn, so a
+    normally auto-allowed fs_read later in the same turn escalates to approval."""
+    config, db = env
+    memory = MemoryStore(db, EventStore(db))
+    memory.record(
+        Event(
+            type=EventType.INGEST_DOCUMENT.value,
+            provenance=Provenance(source="connector:file:notes.md", trusted=False),
+            payload={"text": "The launch codeword is Bluebird."},
+        )
+    )
+    adapter = FakeAdapter([
+        ModelResponse(text="", tool_calls=[
+            ToolCall(id=ulid(), name="memory_recall", arguments={"query": "launch codeword"})
+        ]),
+        ModelResponse(text="", tool_calls=[
+            ToolCall(id=ulid(), name="fs_read", arguments={"path": "x.txt"})
+        ]),
+        ModelResponse(text="Done.", tool_calls=[]),
+    ])
+    traces = TraceStore(db)
+    policy = PolicyEngine(db)
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(
+        config, memory, traces, policy, ModelGateway(adapter), executor, approvals
+    )
+
+    read_needed_approval = False
+    try:
+        async for ev in orch.run_turn("s1", "what's the codeword?"):
+            if ev.kind == "approval_request" and ev.data["tool"] == "fs_read":
+                read_needed_approval = True
+                approvals.resolve(ev.data["approval_id"], approved=True, scope="once")
+    finally:
+        await executor.close()
+
+    assert read_needed_approval is True
+
+
 async def test_plain_answer_no_tools(env) -> None:
     config, db = env
     script = [ModelResponse(text="2 + 2 = 4", tool_calls=[])]

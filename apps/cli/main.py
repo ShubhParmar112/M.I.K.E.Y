@@ -110,9 +110,13 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
     """Interactive chat with approval cards."""
     _ensure_server()
     health = httpx.get(f"{BASE}/v1/health", timeout=5.0).json()
+    fallback = health.get("fallback")
+    provider_line = f"provider: [bold]{health['provider']}[/bold]"
+    if fallback:
+        provider_line += f" [dim](+{fallback} fallback)[/dim]"
     console.print(
         Panel(
-            f"provider: [bold]{health['provider']}[/bold] · "
+            f"{provider_line} · "
             f"build: {health.get('build', '?')} · "
             f"audit chain: {'[green]valid[/green]' if health['audit_chain_valid'] else '[red]BROKEN[/red]'} · "
             f"workspace: {CONFIG.workspace}",

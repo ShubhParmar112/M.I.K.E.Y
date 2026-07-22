@@ -25,6 +25,11 @@ from core.trace.store import TraceStore
 
 MAX_STEPS = 12  # hard stop against runaway loops (review M8's tiny Gen 1 cousin)
 
+# Memory tools run in-process against the projection, not in the sandboxed
+# executor: they read/write M.I.K.E.Y's own state, never the outside world.
+MEMORY_TOOLS = {"memory_recall", "memory_remember"}
+MEMORY_SNIPPET_CHARS = 700
+
 
 @dataclass
 class StreamEvent:
@@ -120,6 +125,7 @@ class Orchestrator:
                 turn_id,
                 "model_call",
                 {
+                    "served_by": self._gateway.last_provider,  # may differ from primary if it fell back
                     "text": resp.text[:2000],
                     "tool_calls": [{"name": t.name, "args": t.arguments} for t in resp.tool_calls],
                     "usage": resp.usage,
@@ -237,7 +243,12 @@ class Orchestrator:
                     ok = False
                 else:
                     try:
-                        result = await self._executor.call(tc.name, tc.arguments)
+                        if tc.name in MEMORY_TOOLS:
+                            result = self._call_memory_tool(
+                                tc.name, tc.arguments, tainted_turn, turn_id
+                            )
+                        else:
+                            result = await self._executor.call(tc.name, tc.arguments)
                     except Exception as exc:
                         # An executor failure must degrade the ACTION, never
                         # crash the turn or the client's stream.
@@ -281,6 +292,56 @@ class Orchestrator:
             "error",
             {"message": f"turn exceeded {MAX_STEPS} steps and was stopped (runaway guard)"},
         )
+
+    def _call_memory_tool(
+        self, name: str, args: dict[str, Any], tainted: bool, turn_id: str
+    ) -> ExecResult:
+        """In-process memory tools. Recall returns provenance-annotated hits and
+        taints the turn if any hit is untrusted; remember persists a durable note
+        whose trust mirrors the turn's (a tainted turn can only plant an untrusted
+        fact, and policy has already forced that path through the user)."""
+        if name == "memory_recall":
+            query = str(args.get("query", "")).strip()
+            if not query:
+                return ExecResult(False, "memory_recall requires a 'query'.", False)
+            try:
+                k = int(args.get("k", 6))
+            except (TypeError, ValueError):
+                k = 6
+            hits = self._memory.recall(query, k=max(1, min(k, 20)))
+            if not hits:
+                return ExecResult(True, "No memories matched that query.", False)
+            lines = []
+            any_untrusted = False
+            for h in hits:
+                any_untrusted = any_untrusted or not h.trusted
+                trust = "trusted" if h.trusted else "UNTRUSTED"
+                lines.append(
+                    f"[{h.event_id} · {h.ts[:10]} · {h.source} · {trust}] "
+                    f"{h.text[:MEMORY_SNIPPET_CHARS]}"
+                )
+            return ExecResult(True, "\n".join(lines), any_untrusted)
+
+        if name == "memory_remember":
+            text = str(args.get("text", "")).strip()
+            if not text:
+                return ExecResult(False, "memory_remember requires 'text'.", False)
+            ev = self._memory.record(
+                Event(
+                    type=EventType.MEMORY_NOTE.value,
+                    device=self._config.device_id,
+                    provenance=Provenance(
+                        source="user" if not tainted else "agent",
+                        trusted=not tainted,
+                    ),
+                    payload={"text": text, "turn_id": turn_id},
+                )
+            )
+            return ExecResult(
+                True, f"Remembered (id {ev.id}); I'll recall this in future conversations.", False
+            )
+
+        return ExecResult(False, f"unknown memory tool: {name}", False)
 
 
 def stream_event_json(ev: StreamEvent) -> str:

@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from core.models.gateway import ChatMessage, ModelResponse, ToolCall
+from core.models.gateway import ChatMessage, ModelResponse, ModelUnavailable, ToolCall
 from core.events.schema import ulid
 
 
@@ -54,7 +54,18 @@ class OllamaAdapter:
             ]
 
         async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(f"{self._base_url}/api/chat", json=body)
+            try:
+                resp = await client.post(f"{self._base_url}/api/chat", json=body)
+            except httpx.TransportError as exc:
+                # As a fallback provider, "not running" is the common case — say so
+                # in terms the gateway can relay to the user.
+                raise ModelUnavailable(
+                    "ollama", "not running (is Ollama installed and started?)"
+                ) from exc
+            if resp.status_code == 404:
+                raise ModelUnavailable(
+                    "ollama", f"model '{self._model}' not pulled (run: ollama pull {self._model})"
+                )
             resp.raise_for_status()
             data = resp.json()
 

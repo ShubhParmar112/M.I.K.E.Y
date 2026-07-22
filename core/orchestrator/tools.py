@@ -57,4 +57,37 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["url"],
         },
     },
+    {
+        "name": "memory_recall",
+        "description": (
+            "Search your own long-term memory for what you already know. Use this "
+            "whenever the user refers to something from a past conversation, an "
+            "ingested document, or a fact they told you earlier. Results carry their "
+            "source, date, and trust level — cite the source when you use one."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "what to look for"},
+                "k": {"type": "integer", "description": "max results (default 6)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "memory_remember",
+        "description": (
+            "Persist a durable fact so you can recall it in future conversations. "
+            "Use this when the user asks you to remember something, or states a "
+            "lasting preference or fact worth keeping. Store one clear, self-contained "
+            "fact per call — write it so it still makes sense with no surrounding context."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "the fact to remember"},
+            },
+            "required": ["text"],
+        },
+    },
 ]

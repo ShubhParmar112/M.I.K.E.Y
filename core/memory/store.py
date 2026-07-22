@@ -24,6 +24,7 @@ PROJECTED_TYPES = {
     EventType.USER_MESSAGE.value,
     EventType.ASSISTANT_MESSAGE.value,
     EventType.INGEST_DOCUMENT.value,
+    EventType.MEMORY_NOTE.value,
 }
 
 

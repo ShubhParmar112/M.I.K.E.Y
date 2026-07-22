@@ -46,6 +46,11 @@ RULES: dict[str, Decision] = {
     "fs_write": Decision.ASK,
     "run_command": Decision.ASK,
     "web_fetch": Decision.ALLOW,
+    "memory_recall": Decision.ALLOW,
+    # Remembering writes only to M.I.K.E.Y's own state (no outside effect), so it
+    # auto-allows on a clean turn — but a tainted turn escalates it to ASK below,
+    # closing the memory-poisoning channel where untrusted content plants a "fact".
+    "memory_remember": Decision.ALLOW,
 }
 
 

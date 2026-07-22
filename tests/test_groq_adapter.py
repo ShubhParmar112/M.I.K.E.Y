@@ -127,6 +127,50 @@ async def test_tool_result_roundtrip_and_text_response() -> None:
     assert resp.tool_calls == []
 
 
+async def test_inline_function_tag_is_recovered_as_tool_call() -> None:
+    """Llama sometimes returns a tool call as literal text in `content` instead of
+    a structured tool_call. The adapter must recover it (so it executes) and strip
+    it from the visible text (so the user never sees the raw tag)."""
+    captured: dict[str, Any] = {}
+    content = (
+        'Sure, let me look that up. '
+        '<function=memory_recall>{"query": "dog name", "k": "6"}</function>'
+    )
+    adapter = GroqAdapter(
+        model="m", api_key="k",
+        transport=_mock({"choices": [{"message": {"content": content}}], "usage": {}}, captured),
+    )
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="hi")], TOOLS)
+
+    assert resp.text == "Sure, let me look that up."  # tag stripped from the reply
+    assert len(resp.tool_calls) == 1
+    assert resp.tool_calls[0].name == "memory_recall"
+    assert resp.tool_calls[0].arguments == {"query": "dog name", "k": "6"}
+
+
+async def test_structured_tool_calls_win_over_inline_text() -> None:
+    """If Groq returns a real structured tool_call, that is authoritative even if
+    the content also happens to contain a function-like tag."""
+    captured: dict[str, Any] = {}
+    adapter = GroqAdapter(
+        model="m", api_key="k",
+        transport=_mock(
+            {
+                "choices": [{"message": {
+                    "content": "<function=ignored>{}</function>",
+                    "tool_calls": [{"id": "c1", "type": "function",
+                                    "function": {"name": "fs_read",
+                                                 "arguments": '{"path": "a.txt"}'}}],
+                }}],
+                "usage": {},
+            },
+            captured,
+        ),
+    )
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="hi")], TOOLS)
+    assert [tc.name for tc in resp.tool_calls] == ["fs_read"]
+
+
 async def test_tool_use_failed_is_retried() -> None:
     requests: list[dict[str, Any]] = []
     adapter = GroqAdapter(model="m", api_key="k", transport=_flaky(1, requests))

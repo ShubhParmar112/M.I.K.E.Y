@@ -36,6 +36,16 @@ class Config:
     groq_model: str = field(
         default_factory=lambda: os.environ.get("MIKEY_GROQ_MODEL", "llama-3.3-70b-versatile")
     )
+    # Hybrid routing: when a cloud provider is primary, fall back to a local
+    # Ollama model on rate-limit/offline. Set MIKEY_LOCAL_FALLBACK=0 to disable.
+    local_fallback: bool = field(
+        default_factory=lambda: os.environ.get("MIKEY_LOCAL_FALLBACK", "1") != "0"
+    )
+    fallback_ollama_model: str = field(
+        default_factory=lambda: os.environ.get(
+            "MIKEY_FALLBACK_MODEL", os.environ.get("MIKEY_OLLAMA_MODEL", "llama3.2")
+        )
+    )
     # Approximate context budget for assembly, in characters (~4 chars/token).
     context_budget_chars: int = 24_000
     device_id: str = field(default_factory=lambda: os.environ.get("MIKEY_DEVICE", "dev_desktop_1"))

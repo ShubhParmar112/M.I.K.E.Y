@@ -30,6 +30,12 @@ $env:ANTHROPIC_API_KEY = "sk-ant-..."       # cloud (Claude), or:
 $env:GROQ_API_KEY = "gsk_..."               # cloud (Groq, free tier, Llama 3.3), or:
 # install Ollama + `ollama pull llama3.2`   # local / private
 
+# hybrid (recommended): a cloud primary with a local fallback. If Ollama is
+# installed, M.I.K.E.Y auto-routes to it when the cloud model is rate-limited
+# (429) or unreachable (offline) — so a Groq free-tier limit is no longer fatal.
+#   MIKEY_LOCAL_FALLBACK=0        disable the fallback
+#   MIKEY_FALLBACK_MODEL=qwen2.5:3b   choose the local fallback model
+
 uv run mikey chat            # interactive chat with approval cards
 uv run mikey trace           # "why did you do that?" — trace tree of the last turn
 uv run mikey events          # inspect the event log
@@ -42,6 +48,8 @@ uv run mikey reindex         # rebuild the memory index from the event log
 ```
 
 Data lives in `~/.mikey/` (event log, audit chain, traces); the agent's sandbox is `~/.mikey/workspace/`. Reads are auto-allowed; writes and commands require approval (`y` once / `s` for the session); unknown tools are denied. Web content is taint-marked and can never authorize actions.
+
+M.I.K.E.Y also reaches its memory *during* a conversation: `memory_recall` searches long-term memory on demand (not just the handful pre-loaded each turn) and `memory_remember` persists a durable fact when you ask it to — so "remember my dog is named Pixel" now sticks, and "what's my dog's name?" later retrieves it with provenance. Recalling an untrusted memory taints the turn just like ingested files do.
 
 ## Gen 1 status
 
