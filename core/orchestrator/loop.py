@@ -353,7 +353,19 @@ class Orchestrator:
             msg = f"Remembered (id {result.event_id})."
             if result.superseded:
                 msg += f" Replaced older memory: {', '.join(result.superseded)}."
-            if result.related:
+            if result.grounding:
+                # Confront the model with what sources already say, so a stored
+                # claim is checked against evidence, not just asserted or flattered.
+                cites = "; ".join(
+                    f"[{h.source} · {'trusted' if h.trusted else 'UNTRUSTED'}] {h.text[:160]}"
+                    for h in result.grounding
+                )
+                msg += (
+                    f" Existing memory on this: {cites}. If your claim conflicts with a "
+                    "source, tell the user and cite it rather than just agreeing; if the "
+                    "source supports it, cite the source."
+                )
+            elif result.related:
                 msg += (
                     " Possibly related or conflicting existing memories: "
                     f"{', '.join(result.related)} — recall them if you need to reconcile."

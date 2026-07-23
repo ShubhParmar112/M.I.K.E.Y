@@ -1,0 +1,35 @@
+{
+  "_comment": "Personal retrieval golden set (Gen 2 exit criterion). Seed set — grow toward 50 real cases as you use M.I.K.E.Y. Each case: query + `relevant` doc ids that should be retrieved ([] = negative, nothing should surface). The harness ingests `corpus` into a throwaway index and scores recall.",
+  "corpus": [
+    {
+      "id": "mmp",
+      "text": "The Middle Man's Path: An Innovative Approach to Transportation Logistics. Authors: Shubh Parmar and Sheetal Gonsalves, NMIMS University Mumbai, presented at the 2025 IEEE ICSIT conference. The paper proposes a new method called The Middle Man's Path (MMP) for finding the initial solution to a transportation problem in operations research. MMP produces the same solution as VAM (Vogel's Approximation Method) while keeping steps as simple as the Northwest Corner Method. Existing initial-solution methods it compares against include NWCM, LCM, VAM, RM, CM, Heuristic Method 1, Heuristic Method 2, and RAM. The aim is cost-efficiency in supply chain management and moving goods from source to destination."
+    },
+    {
+      "id": "provider",
+      "text": "M.I.K.E.Y runs cloud inference on Groq using the llama-3.3-70b-versatile model, with a local Ollama llama3.2 model as an offline fallback selected by the Model Gateway when Groq is rate-limited."
+    },
+    {
+      "id": "roadmap",
+      "text": "M.I.K.E.Y follows a ten-generation roadmap. Generation 1 is the trustworthy core with an event log, policy engine, and sandboxed executor. Generation 2 is memory that deserves the name, adding ingestion, provenance, and verified forgetting. Generation 10, the JARVIS threshold, is bounded autonomy where standing delegations run within earned policy envelopes."
+    },
+    {
+      "id": "cooking",
+      "text": "Classic chocolate lava cake recipe: melt butter with dark chocolate, whisk in eggs and sugar, fold in flour, pour into ramekins, and bake in a hot oven for twelve minutes until the edges set while the center stays molten."
+    }
+  ],
+  "cases": [
+    {"id": "mmp_author", "query": "who is the main author of the middle man's path paper", "relevant": ["mmp"]},
+    {"id": "mmp_equiv", "query": "which method gives the same solution as the middle man's path", "relevant": ["mmp"]},
+    {"id": "mmp_domain", "query": "optimizing the transportation problem in operations research", "relevant": ["mmp"]},
+    {"id": "mmp_initial", "query": "methods for finding the initial solution of a transportation problem", "relevant": ["mmp"]},
+    {"id": "mmp_conf", "query": "which conference was the middle man's path presented at", "relevant": ["mmp"]},
+    {"id": "provider_model", "query": "what cloud model does mikey use for inference", "relevant": ["provider"]},
+    {"id": "provider_fallback", "query": "what is the offline fallback model", "relevant": ["provider"]},
+    {"id": "roadmap_gen1", "query": "what is generation 1 the trustworthy core", "relevant": ["roadmap"]},
+    {"id": "roadmap_jarvis", "query": "which generation is the jarvis threshold bounded autonomy", "relevant": ["roadmap"]},
+    {"id": "cooking_recipe", "query": "chocolate lava cake baking recipe ramekins", "relevant": ["cooking"]},
+    {"id": "neg_bio", "query": "photosynthesis chlorophyll sunlight reaction", "relevant": []},
+    {"id": "neg_sport", "query": "cricket batsman umpire wicket", "relevant": []}
+  ]
+}

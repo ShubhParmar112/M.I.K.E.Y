@@ -60,6 +60,9 @@ class RememberResult:
     duplicate_of: str | None = None
     superseded: list[str] = field(default_factory=list)
     related: list[str] = field(default_factory=list)
+    # Pre-existing memory (incl. ingested sources) relevant to this fact, so the
+    # caller can verify/cite instead of confabulating or flattering.
+    grounding: list["MemoryHit"] = field(default_factory=list)
 
 
 class MemoryStore:
@@ -163,6 +166,15 @@ class MemoryStore:
                 event_id=scored[0][1].id, status="duplicate", duplicate_of=scored[0][1].id
             )
 
+        # What do external SOURCES (ingested docs, connectors) say about this?
+        # Restricted to citable provenance on purpose: grounding a claim against
+        # conversation chatter — including the assistant's own past mistakes — would
+        # reinforce errors, not catch them. Captured before recording.
+        grounding = [
+            h for h in self.recall(text, k=12)
+            if h.source.startswith(("connector:", "web:"))
+        ][:2]
+
         known_ids = {n.id for _, n in scored}
         superseded: list[str] = []
         for sid in supersedes:
@@ -188,6 +200,7 @@ class MemoryStore:
             status="superseded" if superseded else "stored",
             superseded=superseded,
             related=related,
+            grounding=grounding,
         )
 
     # ---- forgetting: tombstone + purge projections + verify ----

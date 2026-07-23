@@ -91,6 +91,20 @@ def test_remember_flags_related_but_distinct_fact(db: Database) -> None:
     assert first.event_id in second.related
 
 
+def test_remember_grounds_claim_against_existing_source(db: Database) -> None:
+    """Storing a factual claim surfaces what existing memory/sources say about it,
+    so the assistant can verify and cite instead of confabulating or flattering."""
+    memory = _memory(db)
+    memory.record(_doc(
+        "The authors of the MMP paper are Shubh Parmar and Sheetal Gonsalves.",
+        source="connector:file:2169.pdf",
+    ))
+    r = memory.remember("Shubh Parmar is the main author of the MMP paper.")
+    assert r.status == "stored"
+    assert any(h.source == "connector:file:2169.pdf" for h in r.grounding)
+    assert any("Sheetal Gonsalves" in h.text for h in r.grounding)  # the source text is surfaced
+
+
 def test_reindex_rebuilds_projection_from_log(db: Database) -> None:
     memory = _memory(db)
     memory.record(_doc("Fact one about quasar alignment."))

@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -18,6 +19,7 @@ import typer
 import uvicorn
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.tree import Tree
 
 from core.config import CONFIG
@@ -295,6 +297,114 @@ def reindex() -> None:
     _ensure_server()
     report = httpx.post(f"{BASE}/v1/memory/reindex", timeout=300.0).json()
     console.print(f"[green]reprojected[/green] {report['reprojected']} events")
+
+
+@app.command()
+def backup() -> None:
+    """Create a verified backup snapshot of the whole store (log + audit chain)."""
+    from core.backup.store import create_backup
+    from core.gateway.app import build_id
+    from core.storage.db import Database
+
+    path, m = create_backup(Database(CONFIG.db_path), CONFIG.home / "backups", build_id())
+    console.print(
+        Panel(
+            f"[green]backup created[/green]\n{path}\n"
+            f"events: [bold]{m.event_count}[/bold] · audit entries: [bold]{m.audit_count}[/bold] · "
+            f"chain: {'[green]valid[/green]' if m.audit_valid else '[red]BROKEN[/red]'}\n"
+            f"sha256: [dim]{m.sha256[:16]}…[/dim]",
+            title="M.I.K.E.Y backup",
+        )
+    )
+
+
+@app.command()
+def restore(
+    backup_path: str = typer.Argument(..., help="path to a mikey-*.db backup file"),
+    yes: bool = typer.Option(False, "--yes", help="skip the confirmation prompt"),
+) -> None:
+    """Restore the store from a backup: verifies it, snapshots current state, then
+    replaces the DB and rebuilds projections from the log."""
+    from core.backup.store import create_backup, restore_backup, verify_backup
+    from core.gateway.app import build_id
+    from core.storage.db import Database
+
+    if _server_running():
+        console.print("[red]Stop the running gateway (close any 'mikey chat') before restoring.[/red]")
+        raise typer.Exit(1)
+
+    ok, issues = verify_backup(Path(backup_path))
+    if not ok:
+        console.print(f"[red]backup failed verification:[/red] {'; '.join(issues)}")
+        raise typer.Exit(1)
+
+    if not yes:
+        ans = console.input(
+            f"[yellow]This overwrites {CONFIG.db_path}. Proceed? \\[y/N]: [/yellow]"
+        ).strip().lower()
+        if ans not in ("y", "yes"):
+            console.print("[dim]aborted[/dim]")
+            return
+
+    if CONFIG.db_path.exists():  # safety net: snapshot current state before overwriting
+        pre, _ = create_backup(Database(CONFIG.db_path), CONFIG.home / "backups", build_id())
+        console.print(f"[dim]current state saved to {pre} first[/dim]")
+
+    report = restore_backup(Path(backup_path), CONFIG.db_path)
+    if report.ok:
+        console.print(
+            Panel(
+                f"[green]restored[/green] · events: [bold]{report.event_count}[/bold] · "
+                f"reprojected: [bold]{report.reprojected}[/bold] · "
+                f"chain: {'[green]valid[/green]' if report.audit_valid else '[red]BROKEN[/red]'}",
+                title="M.I.K.E.Y restore",
+            )
+        )
+    else:
+        console.print(f"[red]restore failed:[/red] {'; '.join(report.issues)}")
+        raise typer.Exit(1)
+
+
+@app.command("eval")
+def run_eval_cmd(
+    update_baseline: bool = typer.Option(
+        False, "--update-baseline", help="save current results as the regression baseline"
+    ),
+) -> None:
+    """Measure retrieval quality against the golden set (Gen 2 exit criterion)."""
+    from core.eval.retrieval import load_golden, run_eval, save_baseline
+
+    report = run_eval(load_golden())
+    console.print(
+        Panel(
+            f"hit@1 [bold]{report.hit_at[1]:.0%}[/bold] · "
+            f"hit@3 [bold]{report.hit_at[3]:.0%}[/bold] · "
+            f"hit@6 [bold]{report.hit_at[6]:.0%}[/bold] · "
+            f"MRR [bold]{report.mrr:.2f}[/bold] · "
+            f"false-positive [bold]{report.false_positive_rate:.0%}[/bold]\n"
+            f"{report.n_positive} positive + {report.n_negative} negative cases",
+            title=f"retrieval eval — {'[green]PASS[/green]' if report.passed else '[red]FAIL[/red]'}",
+            border_style="green" if report.passed else "red",
+        )
+    )
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("case")
+    table.add_column("result")
+    table.add_column("top hit")
+    for c in report.results:
+        result = "[dim]neg[/dim]" if c.negative else (
+            f"rank {c.first_relevant_rank}" if c.first_relevant_rank else "[red]miss[/red]"
+        )
+        mark = "[green]ok[/green]" if c.passed else "[red]XX[/red]"
+        table.add_row(f"{mark} {c.id}", result, (c.top_source or "-").replace("connector:file:", ""))
+    console.print(table)
+    if report.regressions:
+        console.print("[red]regressions vs baseline:[/red]")
+        for r in report.regressions:
+            console.print(f"  {r}")
+    if update_baseline:
+        save_baseline(report)
+        console.print("[dim]baseline updated[/dim]")
 
 
 def main() -> None:

@@ -130,22 +130,29 @@ class PolicyEngine:
             )
 
     def verify_audit_chain(self) -> bool:
-        prev = "GENESIS"
-        for row in self._db.conn.execute("SELECT * FROM audit ORDER BY seq"):
-            expected = hashlib.sha256(
-                "|".join(
-                    [
-                        prev,
-                        row["ts"],
-                        row["actor"],
-                        row["action"],
-                        row["decision"],
-                        row["reason"],
-                        row["payload"],
-                    ]
-                ).encode()
-            ).hexdigest()
-            if row["hash"] != expected or row["prev_hash"] != prev:
-                return False
-            prev = row["hash"]
-        return True
+        return audit_chain_valid(self._db.conn)
+
+
+def audit_chain_valid(conn: Any) -> bool:
+    """Recompute the hash chain over the audit table (any sqlite connection with a
+    Row factory). Shared by the policy engine and the backup verifier so the
+    integrity check has exactly one implementation."""
+    prev = "GENESIS"
+    for row in conn.execute("SELECT * FROM audit ORDER BY seq"):
+        expected = hashlib.sha256(
+            "|".join(
+                [
+                    prev,
+                    row["ts"],
+                    row["actor"],
+                    row["action"],
+                    row["decision"],
+                    row["reason"],
+                    row["payload"],
+                ]
+            ).encode()
+        ).hexdigest()
+        if row["hash"] != expected or row["prev_hash"] != prev:
+            return False
+        prev = row["hash"]
+    return True
