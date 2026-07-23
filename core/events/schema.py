@@ -46,6 +46,8 @@ class EventType(StrEnum):
     ACTION_EXECUTED = "action.executed"
     INGEST_DOCUMENT = "ingest.document"
     MEMORY_NOTE = "memory.note"  # a durable fact M.I.K.E.Y was asked to remember
+    MISSION_CREATED = "mission.created"  # a durable multi-step plan
+    MISSION_STEP_RESULT = "mission.step.result"  # one step's outcome (durable progress)
 
 
 class Provenance(BaseModel):

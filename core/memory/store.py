@@ -11,15 +11,40 @@ behind the same `recall()` seam once a local embedding model is available
 
 from __future__ import annotations
 
+import array
+import math
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from core.events.schema import Event, EventType, Provenance, now
 from core.events.store import EventStore
+from core.models.gateway import ModelUnavailable
 from core.storage.db import Database
 
+
+class Embedder(Protocol):
+    name: str
+
+    def embed(self, text: str) -> list[float]: ...
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else 0.0
+
 _WORD_RE = re.compile(r"[a-z0-9]+")
+
+# Dropped from recall queries so retrieval doesn't OR-match on filler like "in"
+# or "the" and surface irrelevant chunks (a precision fix the eval harness caught).
+STOPWORDS = frozenset(
+    """a an and are as at be been being but by can could did do does down for from had has have
+    how i if in into is it its may me might no not of off on or our out over shall should so than
+    that the their them then these they this those to up us was we were what when where which who
+    whom why will with would you your""".split()
+)
 
 
 def _tokens(text: str) -> set[str]:
@@ -66,9 +91,12 @@ class RememberResult:
 
 
 class MemoryStore:
-    def __init__(self, db: Database, events: EventStore) -> None:
+    def __init__(
+        self, db: Database, events: EventStore, embedder: Embedder | None = None
+    ) -> None:
         self._db = db
         self._events = events
+        self._embedder = embedder  # None → keyword-only retrieval
 
     @property
     def events(self) -> EventStore:
@@ -98,12 +126,32 @@ class MemoryStore:
                 ),
             )
 
-    # ---- read path ----
+    # ---- read path: keyword (BM25) + semantic (vectors), fused ----
 
     def recall(
         self, query: str, k: int = 6, exclude_ids: set[str] | None = None
     ) -> list[MemoryHit]:
-        terms = re.findall(r"[A-Za-z0-9_]{2,}", query)
+        """Hybrid retrieval. Keyword catches exact terms; semantic catches
+        paraphrase ('who created this' → the authors). Fused with reciprocal-rank
+        fusion. Degrades to keyword-only if no embedder is set or it is down, so a
+        missing/paused embedding model never breaks recall."""
+        if self._embedder is None:
+            return self._keyword_recall(query, k, exclude_ids)
+        try:
+            semantic = self._semantic_search(query, k * 3, exclude_ids)
+        except ModelUnavailable:
+            return self._keyword_recall(query, k, exclude_ids)
+        keyword = self._keyword_recall(query, k * 3, exclude_ids)
+        if not semantic:
+            return keyword[:k]
+        return self._rrf_merge(keyword, semantic, k)
+
+    def _keyword_recall(
+        self, query: str, k: int = 6, exclude_ids: set[str] | None = None
+    ) -> list[MemoryHit]:
+        terms = [
+            t for t in re.findall(r"[A-Za-z0-9_]{2,}", query.lower()) if t not in STOPWORDS
+        ]
         if not terms:
             return []
         match = " OR ".join(terms)
@@ -128,6 +176,72 @@ class MemoryStore:
             if r["event_id"] not in exclude
         ]
         return hits[:k]
+
+    def _semantic_search(
+        self, query: str, k: int, exclude_ids: set[str] | None = None
+    ) -> list[MemoryHit]:
+        assert self._embedder is not None
+        qv = self._embedder.embed(query)  # may raise ModelUnavailable
+        exclude = exclude_ids or set()
+        rows = self._db.conn.execute(
+            "SELECT v.event_id, v.vector, m.source, m.trusted, m.ts, m.text "
+            "FROM memory_vectors v JOIN memory_fts m ON v.event_id = m.event_id "
+            "WHERE v.event_id NOT IN (SELECT event_id FROM tombstones)"
+        ).fetchall()
+        scored: list[tuple[float, Any]] = []
+        for r in rows:
+            if r["event_id"] in exclude:
+                continue
+            vec = array.array("f")
+            vec.frombytes(r["vector"])
+            scored.append((_cosine(qv, list(vec)), r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [
+            MemoryHit(
+                event_id=r["event_id"], source=r["source"],
+                trusted=bool(int(r["trusted"])), ts=r["ts"], text=r["text"], rank=-score,
+            )
+            for score, r in scored[:k]
+        ]
+
+    @staticmethod
+    def _rrf_merge(
+        keyword: list[MemoryHit], semantic: list[MemoryHit], k: int, c: int = 60
+    ) -> list[MemoryHit]:
+        """Reciprocal-rank fusion: combine two ranked lists without needing their
+        scores to be on the same scale."""
+        scores: dict[str, float] = {}
+        hit_by_id: dict[str, MemoryHit] = {}
+        for ranked in (keyword, semantic):
+            for rank, h in enumerate(ranked):
+                scores[h.event_id] = scores.get(h.event_id, 0.0) + 1.0 / (c + rank + 1)
+                hit_by_id.setdefault(h.event_id, h)
+        order = sorted(scores, key=lambda e: scores[e], reverse=True)
+        return [hit_by_id[e] for e in order[:k]]
+
+    def index_vectors(self) -> int:
+        """Embed and store any projected memory chunk that lacks a vector yet
+        (incremental — cheap to call repeatedly). No-op without an embedder."""
+        if self._embedder is None:
+            return 0
+        rows = self._db.conn.execute(
+            "SELECT event_id, text FROM memory_fts "
+            "WHERE event_id NOT IN (SELECT event_id FROM memory_vectors) "
+            "AND event_id NOT IN (SELECT event_id FROM tombstones)"
+        ).fetchall()
+        count = 0
+        for r in rows:
+            try:
+                vec = self._embedder.embed(r["text"])
+            except ModelUnavailable:
+                break  # embedder down — leave the rest for a later pass
+            with self._db.conn as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO memory_vectors (event_id, vector) VALUES (?, ?)",
+                    (r["event_id"], array.array("f", vec).tobytes()),
+                )
+            count += 1
+        return count
 
     # ---- durable notes with hygiene: dedup, supersede, flag conflicts ----
 
@@ -212,6 +326,7 @@ class MemoryStore:
                 (event_id, now().isoformat(), reason),
             )
             conn.execute("DELETE FROM memory_fts WHERE event_id = ?", (event_id,))
+            conn.execute("DELETE FROM memory_vectors WHERE event_id = ?", (event_id,))
         remaining = self._db.conn.execute(
             "SELECT COUNT(*) AS n FROM memory_fts WHERE event_id = ?", (event_id,)
         ).fetchone()["n"]
@@ -231,4 +346,7 @@ class MemoryStore:
         for event in self._events.recent(types=list(PROJECTED_TYPES), limit=1_000_000):
             self._project(event)
             count += 1
+        # Vectors are keyed by stable event id, so they survive the fts rebuild;
+        # fill in any that are missing (incremental, no-op without an embedder).
+        self.index_vectors()
         return count

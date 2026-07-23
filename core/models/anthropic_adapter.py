@@ -4,16 +4,25 @@ from __future__ import annotations
 
 from typing import Any
 
+import anthropic
 from anthropic import AsyncAnthropic
 
-from core.models.gateway import ChatMessage, ModelResponse, ToolCall
+from core.models.gateway import ChatMessage, ModelResponse, ModelUnavailable, ToolCall
+
+
+def _retry_after(exc: anthropic.APIStatusError) -> float | None:
+    try:
+        raw = exc.response.headers.get("retry-after")
+        return float(raw) if raw else None
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 class AnthropicAdapter:
     name = "anthropic"
 
-    def __init__(self, model: str) -> None:
-        self._client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY
+    def __init__(self, model: str, client: AsyncAnthropic | None = None) -> None:
+        self._client = client or AsyncAnthropic()  # reads ANTHROPIC_API_KEY
         self._model = model
 
     async def complete(
@@ -58,13 +67,25 @@ class AnthropicAdapter:
             for t in tools
         ]
 
-        resp = await self._client.messages.create(
-            model=self._model,
-            max_tokens=4096,
-            system=system,
-            messages=wire,
-            tools=anthropic_tools or None,
-        )
+        try:
+            resp = await self._client.messages.create(
+                model=self._model,
+                max_tokens=4096,
+                system=system,
+                messages=wire,
+                tools=anthropic_tools or None,
+            )
+        except anthropic.APIConnectionError as exc:
+            # offline / unreachable — a fallback provider can still answer
+            raise ModelUnavailable("anthropic", f"unreachable ({type(exc).__name__})") from exc
+        except anthropic.RateLimitError as exc:
+            raise ModelUnavailable("anthropic", "rate limited (429)", _retry_after(exc)) from exc
+        except anthropic.APIStatusError as exc:
+            # 5xx / 529-overloaded are what the fallback exists for; auth/4xx are
+            # real bugs and must not be masked by silently switching providers.
+            if exc.status_code >= 500:
+                raise ModelUnavailable("anthropic", f"server error ({exc.status_code})") from exc
+            raise
 
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []

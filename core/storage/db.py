@@ -71,6 +71,14 @@ MIGRATIONS: list[list[str]] = [
             reason TEXT NOT NULL
         )""",
     ],
+    # v3 — Gen 2: vector index for semantic retrieval. Another rebuildable
+    # projection over the log; embeddings (float32 blobs) stay on-device.
+    [
+        """CREATE TABLE memory_vectors (
+            event_id TEXT PRIMARY KEY,
+            vector BLOB NOT NULL
+        )""",
+    ],
 ]
 
 

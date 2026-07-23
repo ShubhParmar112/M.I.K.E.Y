@@ -58,6 +58,33 @@ async def test_falls_back_when_primary_unavailable() -> None:
     assert primary.calls == 1 and fallback.calls == 1
 
 
+async def test_chain_tries_each_link_in_order() -> None:
+    """groq → claude → local: each ModelUnavailable rolls to the next link, and
+    the one that answers is recorded as last_provider."""
+    primary = _Fake("groq", error=ModelUnavailable("groq", "rate limited (429)"))
+    mid = _Fake("anthropic", error=ModelUnavailable("anthropic", "overloaded (529)"))
+    last = _Fake("ollama", ModelResponse(text="from local", tool_calls=[]))
+    gw = ModelGateway(primary, fallbacks=[mid, last])
+
+    resp = await gw.complete("", _msgs(), [])
+    assert resp.text == "from local"
+    assert gw.last_provider == "ollama"
+    assert primary.calls == 1 and mid.calls == 1 and last.calls == 1
+    assert gw.fallback_provider == "anthropic, ollama"
+
+
+async def test_whole_chain_down_reports_every_link() -> None:
+    primary = _Fake("groq", error=ModelUnavailable("groq", "rate limited (429)"))
+    mid = _Fake("anthropic", error=ModelUnavailable("anthropic", "overloaded"))
+    last = _Fake("ollama", error=ModelUnavailable("ollama", "not running"))
+    gw = ModelGateway(primary, fallbacks=[mid, last])
+
+    with pytest.raises(RuntimeError) as ei:
+        await gw.complete("", _msgs(), [])
+    msg = str(ei.value)
+    assert "groq" in msg and "anthropic" in msg and "ollama" in msg
+
+
 async def test_no_fallback_gives_actionable_error() -> None:
     primary = _Fake("groq", error=ModelUnavailable("groq", "rate limited (429)", retry_after=8))
     gw = ModelGateway(primary)  # no fallback configured

@@ -30,6 +30,8 @@
     {"id": "roadmap_jarvis", "query": "which generation is the jarvis threshold bounded autonomy", "relevant": ["roadmap"]},
     {"id": "cooking_recipe", "query": "chocolate lava cake baking recipe ramekins", "relevant": ["cooking"]},
     {"id": "neg_bio", "query": "photosynthesis chlorophyll sunlight reaction", "relevant": []},
-    {"id": "neg_sport", "query": "cricket batsman umpire wicket", "relevant": []}
+    {"id": "neg_sport", "query": "cricket batsman umpire wicket", "relevant": []},
+    {"id": "neg_stopwords", "query": "how do I do this in the", "relevant": []},
+    {"id": "neg_stopwords2", "query": "what is that on the one we do", "relevant": []}
   ]
 }

@@ -63,14 +63,24 @@ class ModelAdapter(Protocol):
 
 
 class ModelGateway:
-    """The one door to any LLM. Given a primary adapter and an optional fallback,
-    it serves from the primary and, only when the primary raises ModelUnavailable
-    (rate-limited/offline), transparently retries on the fallback — the hybrid
-    cloud+local routing the module was always meant to enable."""
+    """The one door to any LLM. Given a primary adapter and an ordered chain of
+    fallbacks, it serves from the primary and, only when a provider raises
+    ModelUnavailable (rate-limited/offline), transparently tries the next link —
+    e.g. groq → claude → local — so a rate limit or outage never kills a turn."""
 
-    def __init__(self, adapter: ModelAdapter, fallback: ModelAdapter | None = None) -> None:
+    def __init__(
+        self,
+        adapter: ModelAdapter,
+        fallback: ModelAdapter | None = None,
+        fallbacks: list[ModelAdapter] | None = None,
+    ) -> None:
         self._adapter = adapter
-        self._fallback = fallback
+        if fallbacks is not None:
+            self._fallbacks = list(fallbacks)
+        elif fallback is not None:
+            self._fallbacks = [fallback]
+        else:
+            self._fallbacks = []
         self.total_calls = 0
         # Which adapter actually served the last completion (for traces/health).
         self.last_provider = adapter.name
@@ -81,7 +91,7 @@ class ModelGateway:
 
     @property
     def fallback_provider(self) -> str | None:
-        return self._fallback.name if self._fallback else None
+        return ", ".join(f.name for f in self._fallbacks) or None
 
     async def complete(
         self,
@@ -90,32 +100,29 @@ class ModelGateway:
         tools: list[dict[str, Any]],
     ) -> ModelResponse:
         self.total_calls += 1
-        try:
-            resp = await self._adapter.complete(system, messages, tools)
-            self.last_provider = self._adapter.name
-            return resp
-        except ModelUnavailable as primary_err:
-            if self._fallback is None:
-                # No local safety net: surface a clear, actionable message rather
-                # than a raw HTTP error, and keep the retry hint if we have one.
-                hint = (
-                    f" retry in ~{int(primary_err.retry_after)}s"
-                    if primary_err.retry_after
-                    else " try again shortly"
-                )
-                raise RuntimeError(
-                    f"{primary_err.provider} is unavailable ({primary_err.reason}) and no "
-                    f"local fallback is configured —{hint}, or install Ollama for an offline "
-                    "fallback."
-                ) from primary_err
+        errors: list[ModelUnavailable] = []
+        for adapter in (self._adapter, *self._fallbacks):
             try:
-                resp = await self._fallback.complete(system, messages, tools)
-                self.last_provider = self._fallback.name
+                resp = await adapter.complete(system, messages, tools)
+                self.last_provider = adapter.name
                 return resp
-            except ModelUnavailable as fb_err:
-                raise RuntimeError(
-                    f"both providers are unavailable: {primary_err.provider} "
-                    f"({primary_err.reason}), and the {fb_err.provider} fallback "
-                    f"({fb_err.reason}). If you want offline coverage, make sure Ollama "
-                    "is running with a model pulled."
-                ) from fb_err
+            except ModelUnavailable as exc:
+                errors.append(exc)  # this provider is down; try the next link
+
+        primary_err = errors[0]
+        if len(errors) == 1:  # nothing to fall back to
+            hint = (
+                f" retry in ~{int(primary_err.retry_after)}s"
+                if primary_err.retry_after
+                else " try again shortly"
+            )
+            raise RuntimeError(
+                f"{primary_err.provider} is unavailable ({primary_err.reason}) and no "
+                f"local fallback is configured —{hint}, or install Ollama for an offline "
+                "fallback."
+            ) from primary_err
+        detail = "; ".join(f"{e.provider} ({e.reason})" for e in errors)
+        raise RuntimeError(
+            f"all providers are unavailable: {detail}. If you want offline coverage, "
+            "make sure Ollama is running with a model pulled."
+        ) from errors[-1]

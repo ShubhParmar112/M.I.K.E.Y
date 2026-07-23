@@ -46,6 +46,14 @@ class Config:
             "MIKEY_FALLBACK_MODEL", os.environ.get("MIKEY_OLLAMA_MODEL", "llama3.2")
         )
     )
+    # Semantic retrieval via a local embedding model (degrades to keyword-only if
+    # the model/Ollama is unavailable). Set MIKEY_VECTORS=0 to disable entirely.
+    local_vectors: bool = field(
+        default_factory=lambda: os.environ.get("MIKEY_VECTORS", "1") != "0"
+    )
+    embed_model: str = field(
+        default_factory=lambda: os.environ.get("MIKEY_EMBED_MODEL", "nomic-embed-text")
+    )
     # Approximate context budget for conversation history, in characters
     # (~4 chars/token). Kept lean so a turn's several model calls stay under the
     # provider's per-minute token limit and don't get bounced to the local model.

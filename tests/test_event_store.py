@@ -29,22 +29,24 @@ def test_append_and_recent_roundtrip(db: Database) -> None:
 
 
 def test_migration_upgrades_older_schema_in_place(tmp_path) -> None:
-    """A v1 database (Gen 1 install) must upgrade to v2 on next open."""
+    """A v1 database (Gen 1 install) must upgrade to the latest schema on next open."""
     path = tmp_path / "old.db"
     db = Database(path)
     with db.conn as conn:  # rewind to v1
         conn.execute("DROP TABLE memory_fts")
         conn.execute("DROP TABLE tombstones")
-        conn.execute("DELETE FROM schema_version WHERE version = 2")
+        conn.execute("DROP TABLE memory_vectors")
+        conn.execute("DELETE FROM schema_version WHERE version IN (2, 3)")
     db.close()
     upgraded = Database(path)
-    row = upgraded.conn.execute("SELECT COUNT(*) AS n FROM tombstones").fetchone()
-    assert row["n"] == 0  # v2 tables exist again
+    # the later-generation tables are recreated by re-running migrations
+    assert upgraded.conn.execute("SELECT COUNT(*) AS n FROM tombstones").fetchone()["n"] == 0
+    assert upgraded.conn.execute("SELECT COUNT(*) AS n FROM memory_vectors").fetchone()["n"] == 0
     versions = [
         r["version"]
         for r in upgraded.conn.execute("SELECT version FROM schema_version ORDER BY version")
     ]
-    assert versions == [1, 2]
+    assert versions == [1, 2, 3]
 
 
 def test_recent_without_filter_returns_all_types(db: Database) -> None:

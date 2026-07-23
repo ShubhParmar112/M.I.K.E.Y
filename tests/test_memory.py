@@ -3,11 +3,64 @@ from __future__ import annotations
 from core.events.schema import Event, EventType, Provenance
 from core.events.store import EventStore
 from core.memory.store import MemoryStore
+from core.models.gateway import ModelUnavailable
 from core.storage.db import Database
 
 
 def _memory(db: Database) -> MemoryStore:
     return MemoryStore(db, EventStore(db))
+
+
+class _FakeEmbedder:
+    """Deterministic 3-D embedder: dimension 0 = 'creation/authorship' concept,
+    1 = 'cooking' concept. Lets tests exercise semantic similarity offline."""
+
+    name = "fake-embed"
+
+    def embed(self, text: str) -> list[float]:
+        t = text.lower()
+        creation = float(any(w in t for w in ("author", "invent", "creat", "made", "develop",
+                                              "middle man")))
+        cooking = float(any(w in t for w in ("cake", "recipe", "bake", "oven")))
+        return [creation, cooking, 0.1]
+
+
+class _DownEmbedder:
+    name = "down-embed"
+
+    def embed(self, text: str) -> list[float]:
+        raise ModelUnavailable("ollama-embed", "not running")
+
+
+def test_hybrid_recall_finds_paraphrase_via_vectors(db: Database) -> None:
+    memory = MemoryStore(db, EventStore(db), embedder=_FakeEmbedder())
+    memory.record(_doc("The Middle Man's Path was developed by Shubh Parmar.",
+                       source="connector:file:mmp.md"))
+    memory.record(_doc("Classic chocolate cake recipe: bake it in the oven.",
+                       source="connector:file:cook.md"))
+    assert memory.index_vectors() == 2
+
+    # keyword alone misses the paraphrase (no shared content words)
+    assert memory._keyword_recall("who invented this approach", 6) == []
+    # hybrid retrieval finds it semantically
+    hits = memory.recall("who invented this approach", k=3)
+    assert hits and any("Middle Man" in h.text for h in hits)
+
+
+def test_recall_degrades_to_keyword_when_embedder_down(db: Database) -> None:
+    memory = MemoryStore(db, EventStore(db), embedder=_DownEmbedder())
+    memory.record(_doc("The policy engine mediates every side effect."))
+    hits = memory.recall("policy engine side effect")  # embedder down → keyword still works
+    assert hits and "policy engine" in hits[0].text
+
+
+def test_forget_removes_the_vector(db: Database) -> None:
+    memory = MemoryStore(db, EventStore(db), embedder=_FakeEmbedder())
+    ev = memory.record(_doc("A secret about the middle man path.", source="connector:file:s.md"))
+    memory.index_vectors()
+    assert db.conn.execute("SELECT COUNT(*) c FROM memory_vectors").fetchone()["c"] == 1
+    memory.forget(ev.id)
+    assert db.conn.execute("SELECT COUNT(*) c FROM memory_vectors").fetchone()["c"] == 0
 
 
 def _doc(text: str, source: str = "connector:file:notes.md", trusted: bool = False) -> Event:
@@ -27,6 +80,16 @@ def test_record_projects_and_recall_finds(db: Database) -> None:
     assert "ten generations" in hits[0].text
     assert hits[0].source == "connector:file:notes.md"
     assert hits[0].trusted is False
+
+
+def test_recall_ignores_stopwords(db: Database) -> None:
+    """Filler words must not OR-match and surface irrelevant chunks (precision)."""
+    memory = _memory(db)
+    memory.record(_doc("The transportation optimization method reduces overall cost."))
+    # a query that is only stopwords retrieves nothing (no spurious hit on 'the'/'do'/'in')
+    assert memory.recall("what is it that we do in the") == []
+    # real content words still retrieve
+    assert memory.recall("how do we optimize transportation cost")
 
 
 def test_recall_excludes_ids_and_empty_query(db: Database) -> None:

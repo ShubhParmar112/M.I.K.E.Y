@@ -410,6 +410,9 @@ class Orchestrator:
                     "text or PDF file.",
                     False,
                 )
+            # Note: we deliberately do NOT embed here — indexing is slow on a CPU
+            # (~seconds per chunk) and would block the turn. Keyword recall works
+            # on the new content immediately; `mikey reindex` builds the vectors.
             msg = (
                 f"Ingested {n} file(s), {report['chunks']} chunks into memory — you can now "
                 "recall and answer questions about it."

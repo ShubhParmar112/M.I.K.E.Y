@@ -6,6 +6,7 @@ Binds to localhost only in Gen 1.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -43,14 +44,25 @@ def _make_adapter(config: Config) -> ModelAdapter:
     return FakeAdapter()
 
 
-def _make_fallback(config: Config) -> ModelAdapter | None:
-    """A local Ollama fallback when a cloud provider is primary. If the primary
-    is already local (ollama) or the offline path is disabled, there is none."""
-    if not config.local_fallback or config.provider not in ("groq", "anthropic"):
-        return None
-    from core.models.ollama_adapter import OllamaAdapter
+def _make_fallbacks(config: Config) -> list[ModelAdapter]:
+    """An ordered failover chain: a second cloud model (if its key is present and
+    it isn't already primary), then the local model last for offline coverage —
+    e.g. groq → claude → ollama. So a rate limit rolls to the next link, not to a
+    hard error and not straight to the weak local model."""
+    chain: list[ModelAdapter] = []
+    if config.provider != "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
+        from core.models.anthropic_adapter import AnthropicAdapter
 
-    return OllamaAdapter(config.ollama_base_url, config.fallback_ollama_model)
+        chain.append(AnthropicAdapter(config.anthropic_model))
+    if config.provider != "groq" and os.environ.get("GROQ_API_KEY"):
+        from core.models.groq_adapter import GroqAdapter
+
+        chain.append(GroqAdapter(config.groq_model))
+    if config.local_fallback and config.provider in ("groq", "anthropic"):
+        from core.models.ollama_adapter import OllamaAdapter
+
+        chain.append(OllamaAdapter(config.ollama_base_url, config.fallback_ollama_model))
+    return chain
 
 
 def build_id() -> str:
@@ -80,7 +92,12 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
     config.ensure_dirs()
     db = Database(config.db_path)
     events = EventStore(db)
-    memory = MemoryStore(db, events)
+    embedder = None
+    if config.local_vectors:
+        from core.models.embeddings import OllamaEmbedder
+
+        embedder = OllamaEmbedder(config.ollama_base_url, config.embed_model)
+    memory = MemoryStore(db, events, embedder)
     ingestor = FileIngestor(memory, config.device_id)
     traces = TraceStore(db)
     policy = PolicyEngine(db)
@@ -91,7 +108,7 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
     if adapter is not None:
         gateway = ModelGateway(adapter)
     else:
-        gateway = ModelGateway(_make_adapter(config), fallback=_make_fallback(config))
+        gateway = ModelGateway(_make_adapter(config), fallbacks=_make_fallbacks(config))
     orch = Orchestrator(config, memory, traces, policy, gateway, executor, approvals)
 
     app = FastAPI(title="M.I.K.E.Y Gateway", version="0.1.0")
