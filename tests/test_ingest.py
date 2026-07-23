@@ -58,3 +58,22 @@ def test_ingest_missing_path_reports_error(db: Database, tmp_path: Path) -> None
     memory = MemoryStore(db, EventStore(db))
     report = FileIngestor(memory, "dev_test").ingest_path(tmp_path / "nope")
     assert report["ok"] is False
+
+
+def test_reingesting_same_file_is_skipped_not_duplicated(db: Database, tmp_path: Path) -> None:
+    """A file already in memory must not be ingested again (no bloat, no re-work),
+    unless force=True — this is what stopped the 4x-ingest / approval spam."""
+    f = tmp_path / "paper.md"
+    f.write_text("The theorem proves quibits stabilize.\n\nA second paragraph here.",
+                 encoding="utf-8")
+    ingestor = FileIngestor(MemoryStore(db, EventStore(db)), "dev_test")
+
+    first = ingestor.ingest_path(f)
+    assert first["files_ingested"] == 1 and first["chunks"] >= 1
+
+    second = ingestor.ingest_path(f)  # same file again
+    assert second["files_ingested"] == 0
+    assert "paper.md" in second["already_ingested"]
+
+    forced = ingestor.ingest_path(f, force=True)  # explicit re-ingest of a changed file
+    assert forced["files_ingested"] == 1

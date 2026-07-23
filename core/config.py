@@ -46,8 +46,12 @@ class Config:
             "MIKEY_FALLBACK_MODEL", os.environ.get("MIKEY_OLLAMA_MODEL", "llama3.2")
         )
     )
-    # Approximate context budget for assembly, in characters (~4 chars/token).
-    context_budget_chars: int = 24_000
+    # Approximate context budget for conversation history, in characters
+    # (~4 chars/token). Kept lean so a turn's several model calls stay under the
+    # provider's per-minute token limit and don't get bounced to the local model.
+    context_budget_chars: int = field(
+        default_factory=lambda: int(os.environ.get("MIKEY_CONTEXT_CHARS", "10000"))
+    )
     device_id: str = field(default_factory=lambda: os.environ.get("MIKEY_DEVICE", "dev_desktop_1"))
 
     @property

@@ -308,6 +308,42 @@ async def test_memory_forget_requires_approval(env) -> None:
     assert policy.verify_audit_chain() is True
 
 
+async def test_ingest_tool_reads_a_file_and_requires_approval(env, tmp_path: Path) -> None:
+    """M.I.K.E.Y can ingest a document from a path (even outside the workspace)
+    via the ingest tool — approval-gated — and its contents become recallable."""
+    config, db = env
+    doc = tmp_path / "paper.md"
+    doc.write_text("The Zorblax theorem proves quibits stabilize at dawn.", encoding="utf-8")
+    memory = MemoryStore(db, EventStore(db))
+    script = [
+        ModelResponse(text="", tool_calls=[
+            ToolCall(id=ulid(), name="ingest", arguments={"path": str(doc)})
+        ]),
+        ModelResponse(text="Ingested — ask me anything about it.", tool_calls=[]),
+    ]
+    traces = TraceStore(db)
+    policy = PolicyEngine(db)
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(
+        config, memory, traces, policy, ModelGateway(FakeAdapter(script)), executor, approvals
+    )
+
+    asked = False
+    try:
+        async for ev in orch.run_turn("s1", "ingest my paper"):
+            if ev.kind == "approval_request" and ev.data["tool"] == "ingest":
+                asked = True
+                approvals.resolve(ev.data["approval_id"], approved=True, scope="once")
+    finally:
+        await executor.close()
+
+    assert asked is True  # reading a file off disk is approval-gated
+    zorblax = [h for h in memory.recall("Zorblax theorem quibits") if "Zorblax" in h.text]
+    assert zorblax  # the document's contents are now in memory
+    assert all(not h.trusted for h in zorblax)  # and correctly marked untrusted
+
+
 async def test_recall_of_untrusted_memory_taints_the_turn(env) -> None:
     """memory_recall that surfaces an untrusted memory must taint the turn, so a
     normally auto-allowed fs_read later in the same turn escalates to approval."""

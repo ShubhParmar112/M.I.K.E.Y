@@ -53,7 +53,16 @@ RULES: dict[str, Decision] = {
     "memory_remember": Decision.ALLOW,
     # Forgetting is destructive and irreversible: always confirm with the user.
     "memory_forget": Decision.ASK,
+    # Ingest reads a user-named file from anywhere on disk (outside the sandbox)
+    # into memory — confirm the path with the user first.
+    "ingest": Decision.ASK,
 }
+
+# Auto-allowed tools that stay allowed even on a tainted turn: they only READ
+# M.I.K.E.Y's own memory and cannot exfiltrate or cause an external side effect,
+# so escalating them to an approval card is pure friction (the exfil channels —
+# web_fetch, run_command, fs_write — remain gated regardless).
+TAINT_SAFE_TOOLS = {"memory_recall"}
 
 
 class PolicyEngine:
@@ -66,7 +75,7 @@ class PolicyEngine:
         base = RULES.get(req.tool)
         if base is None:
             result = PolicyResult(Decision.DENY, f"tool '{req.tool}' is not in the policy table")
-        elif req.tainted and base is Decision.ALLOW:
+        elif req.tainted and base is Decision.ALLOW and req.tool not in TAINT_SAFE_TOOLS:
             # Untrusted content may inform but never authorize (review W4). This
             # includes web_fetch: a tainted turn fetching a crafted URL is the
             # classic exfiltration channel, so it must go through the user.

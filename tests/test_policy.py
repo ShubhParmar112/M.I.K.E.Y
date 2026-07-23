@@ -27,6 +27,15 @@ def test_taint_escalates_allow_to_ask(db: Database) -> None:
     assert policy.evaluate(_req("web_fetch", tainted=False)).decision is Decision.ALLOW
 
 
+def test_memory_recall_is_taint_safe(db: Database) -> None:
+    """A pure internal memory read can't exfiltrate, so it stays auto-allowed even
+    on a tainted turn — no approval fatigue once a document is in play."""
+    policy = PolicyEngine(db)
+    assert policy.evaluate(_req("memory_recall", tainted=True)).decision is Decision.ALLOW
+    # but the exfil channels are still gated on a tainted turn
+    assert policy.evaluate(_req("web_fetch", tainted=True)).decision is Decision.ASK
+
+
 def test_session_grant_converts_ask_to_allow(db: Database) -> None:
     policy = PolicyEngine(db)
     req = _req("fs_write")

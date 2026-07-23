@@ -18,7 +18,9 @@ from core.events.schema import ulid
 from core.models.gateway import ChatMessage, ModelResponse, ModelUnavailable, ToolCall
 
 BASE_URL = "https://api.groq.com/openai/v1"
-MAX_RATE_LIMIT_BACKOFF_S = 4.0  # cap the wait so we still fall back promptly
+# The local fallback is a weak 3B model that hallucinates, so it's worth waiting
+# out a per-minute rate spike on the strong cloud model rather than conceding fast.
+MAX_RATE_LIMIT_BACKOFF_S = 15.0
 
 # Llama on Groq sometimes emits a tool call as literal text inside the message
 # content — `<function=name>{json args}</function>` — instead of a structured
@@ -63,8 +65,8 @@ class GroqAdapter:
         model: str,
         api_key: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
-        rate_limit_retries: int = 2,
-        rate_limit_backoff_s: float = 1.5,
+        rate_limit_retries: int = 4,
+        rate_limit_backoff_s: float = 2.0,
     ) -> None:
         self._model = model
         self._api_key = api_key or os.environ.get("GROQ_API_KEY", "")

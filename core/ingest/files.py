@@ -52,17 +52,29 @@ class FileIngestor:
         self._memory = memory
         self._device_id = device_id
 
-    def ingest_path(self, path: str | Path) -> dict[str, Any]:
+    def _already_ingested_paths(self) -> set[str]:
+        """Files with live (non-tombstoned) ingest chunks already in memory."""
+        events = self._memory.events.recent(
+            types=[EventType.INGEST_DOCUMENT.value], limit=1_000_000
+        )
+        return {str(e.payload.get("file", "")) for e in events}
+
+    def ingest_path(self, path: str | Path, force: bool = False) -> dict[str, Any]:
         root = Path(path).expanduser().resolve()
         if not root.exists():
             return {"ok": False, "error": f"path does not exist: {root}"}
         files = [root] if root.is_file() else sorted(
             p for p in root.rglob("*") if p.is_file()
         )
+        already = set() if force else self._already_ingested_paths()
         ingested: list[str] = []
         skipped: list[str] = []
+        already_ingested: list[str] = []
         chunks_total = 0
         for f in files:
+            if str(f) in already:  # already in memory — don't duplicate it
+                already_ingested.append(f.name)
+                continue
             suffix = f.suffix.lower()
             if suffix not in TEXT_EXTENSIONS and suffix != PDF_EXTENSION:
                 skipped.append(f.name)
@@ -104,4 +116,5 @@ class FileIngestor:
             "files_ingested": len(ingested),
             "chunks": chunks_total,
             "skipped": skipped[:20],
+            "already_ingested": already_ingested[:20],
         }

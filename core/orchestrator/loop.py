@@ -25,9 +25,11 @@ from core.trace.store import TraceStore
 
 MAX_STEPS = 12  # hard stop against runaway loops (review M8's tiny Gen 1 cousin)
 
-# Memory tools run in-process against the projection, not in the sandboxed
-# executor: they read/write M.I.K.E.Y's own state, never the outside world.
+# These tools run in-process, not in the sandboxed executor: memory tools touch
+# M.I.K.E.Y's own state, and `ingest` reads a user-named file (possibly outside
+# the workspace) into memory — both need core-side access the sandbox denies.
 MEMORY_TOOLS = {"memory_recall", "memory_remember", "memory_forget"}
+INPROCESS_TOOLS = MEMORY_TOOLS | {"ingest"}
 MEMORY_SNIPPET_CHARS = 700
 
 
@@ -251,8 +253,8 @@ class Orchestrator:
                     ok = False
                 else:
                     try:
-                        if tc.name in MEMORY_TOOLS:
-                            result = self._call_memory_tool(
+                        if tc.name in INPROCESS_TOOLS:
+                            result = self._call_inprocess_tool(
                                 tc.name, tc.arguments, tainted_turn, turn_id
                             )
                         else:
@@ -301,7 +303,7 @@ class Orchestrator:
             {"message": f"turn exceeded {MAX_STEPS} steps and was stopped (runaway guard)"},
         )
 
-    def _call_memory_tool(
+    def _call_inprocess_tool(
         self, name: str, args: dict[str, Any], tainted: bool, turn_id: str
     ) -> ExecResult:
         """In-process memory tools. Recall returns provenance-annotated hits and
@@ -367,7 +369,44 @@ class Orchestrator:
                 return ExecResult(True, f"Forgotten and verified gone from memory ({event_id}).", False)
             return ExecResult(False, f"Could not verify {event_id} was forgotten.", False)
 
-        return ExecResult(False, f"unknown memory tool: {name}", False)
+        if name == "ingest":
+            path = str(args.get("path", "")).strip()
+            if not path:
+                return ExecResult(False, "ingest requires a 'path'.", False)
+            from core.ingest.files import FileIngestor
+
+            report = FileIngestor(self._memory, self._config.device_id).ingest_path(
+                path, force=bool(args.get("force", False))
+            )
+            if not report.get("ok"):
+                return ExecResult(False, report.get("error", "ingest failed"), False)
+            n = report["files_ingested"]
+            already = report.get("already_ingested") or []
+            if n == 0 and already:
+                # Already in memory — tell the model to recall instead of re-ingesting.
+                return ExecResult(
+                    True,
+                    f"Already ingested ({', '.join(already)}); it's in memory. Use memory_recall "
+                    "to answer — do NOT ingest it again.",
+                    False,
+                )
+            if n == 0:
+                skipped = ", ".join(report.get("skipped") or []) or "nothing matched"
+                return ExecResult(
+                    False,
+                    f"Ingested 0 files (skipped: {skipped}). Check the path and that it's a "
+                    "text or PDF file.",
+                    False,
+                )
+            msg = (
+                f"Ingested {n} file(s), {report['chunks']} chunks into memory — you can now "
+                "recall and answer questions about it."
+            )
+            if report.get("skipped"):
+                msg += f" Skipped: {', '.join(report['skipped'])}."
+            return ExecResult(True, msg, False)
+
+        return ExecResult(False, f"unknown in-process tool: {name}", False)
 
 
 def stream_event_json(ev: StreamEvent) -> str:

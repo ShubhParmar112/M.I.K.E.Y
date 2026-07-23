@@ -114,4 +114,29 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["event_id"],
         },
     },
+    {
+        "name": "ingest",
+        "description": (
+            "Read a document (or a folder of documents) from a file path into long-term "
+            "memory so you can recall and answer questions about its contents. Handles "
+            "text files and PDFs, and can read a path anywhere on disk (not just the "
+            "workspace). Use this whenever the user asks you to read, ingest, or load a "
+            "file — e.g. a PDF on their Desktop. If the user pastes a `mikey ingest <path>` "
+            "command, treat it as a request to ingest that path with this tool; do NOT try "
+            "to run it as a shell command. Requires user approval. Ingest a given file only "
+            "ONCE — if it is already in memory, use memory_recall instead of ingesting again. "
+            "After it succeeds, use memory_recall to pull the relevant parts."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "file or folder path to ingest"},
+                "force": {
+                    "type": "boolean",
+                    "description": "re-ingest even if already in memory (only for a changed file)",
+                },
+            },
+            "required": ["path"],
+        },
+    },
 ]
