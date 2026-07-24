@@ -17,9 +17,10 @@ from training.exporter import TrainingExporter
 
 
 def _seed(events: EventStore) -> None:
-    # Turn A (T1): user → one tool action → assistant reply.
+    # Turn A (T1): user → one tool action → assistant reply. Brain-tagged (S1).
     events.append(Event(type=EventType.USER_MESSAGE.value,
-                        payload={"text": "list my files", "session_id": "s1", "turn_id": "A"}))
+                        payload={"text": "list my files", "session_id": "s1",
+                                 "turn_id": "A", "brain": "operator"}))
     events.append(Event(type=EventType.ACTION_EXECUTED.value,
                         provenance=Provenance(source="agent", trusted=True),
                         payload={"tool": "fs_list", "args": {"path": "."}, "ok": True, "turn_id": "A"}))
@@ -55,8 +56,10 @@ def test_export_respects_tiers(db: Database, tmp_path: Path) -> None:
     # Files are real JSONL and contain what the summary claims.
     convo = [json.loads(x) for x in (tmp_path / "ds" / "conversation.jsonl").read_text().splitlines()]
     assert convo[0]["input"] == "list my files" and convo[0]["tier"] == "T1"
+    assert convo[0]["brain"] == "operator"  # per-brain corpus tag (S1)
     tools = [json.loads(x) for x in (tmp_path / "ds" / "tool_use.jsonl").read_text().splitlines()]
     assert tools[0]["actions"][0]["tool"] == "fs_list"
+    assert tools[0]["brain"] == "operator"
 
 
 def test_include_t0_opt_in(db: Database, tmp_path: Path) -> None:

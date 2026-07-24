@@ -18,8 +18,8 @@ from core.context.assembly import ContextAssembler
 from core.events.schema import Event, EventType, Provenance, ulid
 from core.executor_client import ExecResult, ExecutorClient
 from core.memory.store import MemoryStore
-from core.models.gateway import ChatMessage, ModelGateway
-from core.orchestrator.tools import TOOLS
+from core.models.gateway import ChatMessage, ModelGateway, RoutingMeta
+from core.orchestrator.brains import Router
 from core.policy.engine import ActionRequest, Decision, PolicyEngine
 from core.trace.store import TraceStore
 
@@ -76,22 +76,35 @@ class Orchestrator:
         self._gateway = gateway
         self._executor = executor
         self._approvals = approvals
+        self._router = Router()
         self._assembler = ContextAssembler(
             memory.events, memory, config.context_budget_chars
         )
 
     async def run_turn(self, session_id: str, user_input: str) -> AsyncIterator[StreamEvent]:
         turn_id = ulid()
-        yield StreamEvent("status", {"turn_id": turn_id, "provider": self._gateway.provider})
+        # Route first (S1): pick which brain handles this turn. A social sign-off
+        # goes to the toolless conversation brain — which structurally cannot fire
+        # memory_forget — while anything actionable goes to the full operator.
+        routing = self._router.route(user_input)
+        brain = routing.brain
+        yield StreamEvent(
+            "status",
+            {"turn_id": turn_id, "provider": self._gateway.provider, "brain": brain.name},
+        )
 
         # Assemble BEFORE recording the new user message, or it would appear in
-        # the history AND as the final message (duplicated context).
-        ctx = self._assembler.assemble(user_input)
+        # the history AND as the final message (duplicated context). The brain's
+        # own prompt is the base; memories are injected onto it either way.
+        ctx = self._assembler.assemble(user_input, base_system=brain.system_prompt)
         self._memory.record(
             Event(
                 type=EventType.USER_MESSAGE.value,
                 device=self._config.device_id,
-                payload={"text": user_input, "session_id": session_id, "turn_id": turn_id},
+                payload={
+                    "text": user_input, "session_id": session_id,
+                    "turn_id": turn_id, "brain": brain.name,
+                },
             )
         )
         root = self._traces.span(
@@ -106,9 +119,18 @@ class Orchestrator:
                     for h in ctx.memory_hits
                 ],
                 "provider": self._gateway.provider,
+                "brain": brain.name,
             },
         )
+        self._traces.span(
+            turn_id,
+            "route",
+            {"brain": brain.name, "capability": brain.capability, "reason": routing.reason},
+            parent_id=root,
+        )
 
+        brain_tools = brain.tools
+        meta = RoutingMeta(tier=brain.tier, capability=brain.capability)
         messages = ctx.messages
         # Once untrusted content enters — via retrieved memories or fetched data —
         # later actions are tainted and auto-allows escalate to asking the user.
@@ -118,7 +140,7 @@ class Orchestrator:
 
         for _step in range(MAX_STEPS):
             try:
-                resp = await self._gateway.complete(ctx.system, messages, TOOLS)
+                resp = await self._gateway.complete(ctx.system, messages, brain_tools, meta)
             except Exception as exc:
                 self._traces.span(turn_id, "error", {"error": str(exc)}, parent_id=root)
                 yield StreamEvent("error", {"message": f"model call failed: {exc}"})
@@ -127,6 +149,7 @@ class Orchestrator:
                 turn_id,
                 "model_call",
                 {
+                    "brain": brain.name,
                     "served_by": self._gateway.last_provider,  # may differ from primary if it fell back
                     "text": resp.text[:2000],
                     "tool_calls": [{"name": t.name, "args": t.arguments} for t in resp.tool_calls],
@@ -141,7 +164,10 @@ class Orchestrator:
                         type=EventType.ASSISTANT_MESSAGE.value,
                         device=self._config.device_id,
                         provenance=Provenance(source="agent", trusted=True),
-                        payload={"text": resp.text, "session_id": session_id, "turn_id": turn_id},
+                        payload={
+                            "text": resp.text, "session_id": session_id,
+                            "turn_id": turn_id, "brain": brain.name,
+                        },
                     )
                 )
                 yield StreamEvent(
@@ -280,6 +306,7 @@ class Orchestrator:
                                 "args": tc.arguments,
                                 "ok": ok,
                                 "turn_id": turn_id,
+                                "brain": brain.name,
                             },
                         )
                     )

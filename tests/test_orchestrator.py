@@ -422,6 +422,45 @@ async def test_related_memory_hint_steers_away_from_forget(env) -> None:
     assert "memory_forget" in SYSTEM_PROMPT and "explicitly asks" in SYSTEM_PROMPT
 
 
+async def test_social_turn_uses_toolless_conversation_brain(env) -> None:
+    """S1 routing: a pure sign-off is handled by the conversation brain — its own
+    prompt is used, the routing is traced, the event is tagged, and it gets a
+    single-shot reply with NO tools or actions (the memory_forget incident class)."""
+    config, db = env
+    fake = FakeAdapter([ModelResponse(text="Anytime — catch you later, Shubh.", tool_calls=[])])
+    memory = MemoryStore(db, EventStore(db))
+    traces = TraceStore(db)
+    policy = PolicyEngine(db)
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(config, memory, traces, policy, ModelGateway(fake), executor, approvals)
+
+    turn_id = ""
+    status_brain = ""
+    finals: list[str] = []
+    try:
+        async for ev in orch.run_turn("s1", "that was it for today, ttyl mikey"):
+            if ev.kind == "status":
+                turn_id = ev.data["turn_id"]
+                status_brain = ev.data["brain"]
+            if ev.kind == "final":
+                finals.append(ev.data["text"])
+    finally:
+        await executor.close()
+
+    assert status_brain == "conversation"
+    assert finals == ["Anytime — catch you later, Shubh."]
+    # the conversation brain's own (toolless) prompt was used, not the operator's
+    assert "casual conversation" in fake.systems[0]
+    # routing is recorded in the trace ("why did it go there?")
+    route_spans = [s for s in traces.turn(turn_id) if s["kind"] == "route"]
+    assert route_spans and route_spans[0]["payload"]["brain"] == "conversation"
+    # nothing was executed, and the assistant event is tagged with its brain
+    assert EventType.ACTION_EXECUTED.value not in [e.type for e in memory.events.recent()]
+    asst = [e for e in memory.events.recent() if e.type == EventType.ASSISTANT_MESSAGE.value]
+    assert asst and asst[0].payload.get("brain") == "conversation"
+
+
 async def test_plain_answer_no_tools(env) -> None:
     config, db = env
     script = [ModelResponse(text="2 + 2 = 4", tool_calls=[])]

@@ -60,6 +60,7 @@ class _Turn:
     has_assistant: bool = False
     actions: list[dict[str, Any]] = field(default_factory=list)
     private: bool = False  # any constituent event was Tier-0
+    brain: str = ""  # which brain handled the turn (S1); "" for pre-S1 turns
 
 
 class TrainingExporter:
@@ -89,6 +90,9 @@ class TrainingExporter:
             t = turns[turn_id]
             if ev.tier is Tier.T0:
                 t.private = True
+            brain = str(ev.payload.get("brain", ""))
+            if brain:
+                t.brain = brain
             if ev.type == EventType.USER_MESSAGE.value:
                 t.user_text = str(ev.payload.get("text", ""))
                 t.session_id = str(ev.payload.get("session_id", ""))
@@ -124,6 +128,7 @@ class TrainingExporter:
                     "input": t.user_text,
                     "output": t.assistant_text,
                     "source": t.user_source,
+                    "brain": t.brain,
                     "tier": Tier.T0.value if t.private else Tier.T1.value,
                 }
             )
@@ -144,6 +149,7 @@ class TrainingExporter:
                     "input": t.user_text,
                     "actions": t.actions,
                     "output": t.assistant_text,
+                    "brain": t.brain,
                     "tier": Tier.T0.value if t.private else Tier.T1.value,
                 }
             )

@@ -176,6 +176,11 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
                         status.stop()
                         if kind == "status":
                             last_turn = ev["turn_id"]
+                            # Surface when a non-default brain handled the turn, so
+                            # the routing (S1) is visible — e.g. a sign-off going to
+                            # the toolless conversation brain.
+                            if ev.get("brain") and ev["brain"] != "operator":
+                                console.print(f"[dim]· {ev['brain']} brain[/dim]")
                         elif kind == "action":
                             args = json.dumps(ev["args"], ensure_ascii=False)[:120]
                             console.print(f"[dim]→ {ev['tool']} {args}[/dim]{_served_tag(ev, primary)}")
