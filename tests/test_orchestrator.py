@@ -385,6 +385,43 @@ async def test_recall_of_untrusted_memory_taints_the_turn(env) -> None:
     assert read_needed_approval is True
 
 
+async def test_related_memory_hint_steers_away_from_forget(env) -> None:
+    """Regression for the live memory_forget cascade: when a new fact is similar
+    to an existing one, the tool result must point the model at `supersedes` — never
+    dangle the related ids as things to delete — and must forbid unsolicited forgets."""
+    config, db = env
+    memory = MemoryStore(db, EventStore(db))
+    seed = memory.remember("Pixel is the user's pet dog.")
+    traces = TraceStore(db)
+    policy = PolicyEngine(db)
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(
+        config, memory, traces, policy, ModelGateway(FakeAdapter([])), executor, approvals
+    )
+    try:
+        # Moderately similar (Jaccard ~0.42) → "related", not a duplicate.
+        result = orch._call_inprocess_tool(
+            "memory_remember",
+            {"text": "The user's dog Pixel likes to run in the park."},
+            False,
+            "t1",
+        )
+    finally:
+        await executor.close()
+
+    out = result.output
+    assert seed.event_id in out               # the related memory is surfaced...
+    assert "supersedes" in out                # ...as something to supersede, not delete
+    assert "do NOT use memory_forget" in out
+    assert "unless the user explicitly asks" in out
+
+    # Defence in depth: the same standing rule lives in the system prompt.
+    from core.context.assembly import SYSTEM_PROMPT
+
+    assert "memory_forget" in SYSTEM_PROMPT and "explicitly asks" in SYSTEM_PROMPT
+
+
 async def test_plain_answer_no_tools(env) -> None:
     config, db = env
     script = [ModelResponse(text="2 + 2 = 4", tool_calls=[])]

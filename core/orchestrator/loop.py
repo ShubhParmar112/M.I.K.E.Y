@@ -366,9 +366,15 @@ class Orchestrator:
                     "source supports it, cite the source."
                 )
             elif result.related:
+                # Steer reconciliation toward `supersedes`, never toward deletion:
+                # dangling raw ids next to "reconcile" once led a weak model to fire
+                # memory_forget on each of them at end-of-conversation.
                 msg += (
                     " Possibly related or conflicting existing memories: "
-                    f"{', '.join(result.related)} — recall them if you need to reconcile."
+                    f"{', '.join(result.related)}. If this new fact updates one of them, store the "
+                    "correction with `supersedes` set to retire the old one — do NOT use "
+                    "memory_forget for that. Never forget or delete a memory unless the user "
+                    "explicitly asks you to."
                 )
             return ExecResult(True, msg, False)
 
