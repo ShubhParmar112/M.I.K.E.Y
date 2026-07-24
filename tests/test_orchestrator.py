@@ -5,6 +5,7 @@ written. This is the Gen 1 spine under test."""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -15,6 +16,7 @@ from core.executor_client import ExecutorClient
 from core.memory.store import MemoryStore
 from core.models.fake_adapter import FakeAdapter
 from core.models.gateway import ModelGateway, ModelResponse, ToolCall
+from core.orchestrator.critic import Critic
 from core.orchestrator.loop import ApprovalRegistry, Orchestrator
 from core.policy.engine import PolicyEngine
 from core.storage.db import Database
@@ -508,6 +510,49 @@ async def test_social_turn_uses_toolless_conversation_brain(env) -> None:
     assert EventType.ACTION_EXECUTED.value not in [e.type for e in memory.events.recent()]
     asst = [e for e in memory.events.recent() if e.type == EventType.ASSISTANT_MESSAGE.value]
     assert asst and asst[0].payload.get("brain") == "conversation"
+
+
+async def test_critic_reviews_a_risky_action_before_approval(env) -> None:
+    """S1 critic: a proposed ASK action is reviewed by an independent brain, and its
+    verdict rides on the approval card — here a CONCERN is surfaced before the user
+    decides. The critic runs on its own gateway, so it doesn't touch the operator's
+    script."""
+    config, db = env
+    script = [
+        ModelResponse(text="", tool_calls=[
+            ToolCall(id=ulid(), name="fs_write", arguments={"path": "x.txt", "content": "hi"})
+        ]),
+        ModelResponse(text="ok, leaving it.", tool_calls=[]),
+    ]
+    memory = MemoryStore(db, EventStore(db))
+    traces = TraceStore(db)
+    policy = PolicyEngine(db)
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    critic = Critic(ModelGateway(FakeAdapter(
+        [ModelResponse(text="CONCERN: writes a file the user never asked to create", tool_calls=[])]
+    )))
+    orch = Orchestrator(
+        config, memory, traces, policy, ModelGateway(FakeAdapter(script)),
+        executor, approvals, critic=critic,
+    )
+
+    turn_id = ""
+    card: dict[str, Any] = {}
+    try:
+        async for ev in orch.run_turn("s1", "write a file"):
+            if ev.kind == "status":
+                turn_id = ev.data["turn_id"]
+            if ev.kind == "approval_request":
+                card = ev.data
+                approvals.resolve(ev.data["approval_id"], approved=False, scope="once")
+    finally:
+        await executor.close()
+
+    assert card.get("critic_sound") is False
+    assert "never asked" in card.get("critic_note", "")
+    assert "critic" in [s["kind"] for s in traces.turn(turn_id)]  # traced too
+    assert not (config.workspace / "x.txt").exists()  # user denied → nothing written
 
 
 async def test_plain_answer_no_tools(env) -> None:

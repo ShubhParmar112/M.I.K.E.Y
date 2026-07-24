@@ -20,6 +20,7 @@ from core.executor_client import ExecResult, ExecutorClient
 from core.memory.store import MemoryStore
 from core.models.gateway import ChatMessage, ModelGateway, RoutingMeta
 from core.orchestrator.brains import Router
+from core.orchestrator.critic import Critic
 from core.policy.engine import ActionRequest, Decision, PolicyEngine
 from core.trace.store import TraceStore
 
@@ -68,6 +69,7 @@ class Orchestrator:
         gateway: ModelGateway,
         executor: ExecutorClient,
         approvals: ApprovalRegistry,
+        critic: Critic | None = None,
     ) -> None:
         self._config = config
         self._memory = memory
@@ -77,6 +79,9 @@ class Orchestrator:
         self._executor = executor
         self._approvals = approvals
         self._router = Router()
+        # Optional second-opinion pass on risky actions. Injected so tests and
+        # lightweight callers opt in; the real gateway app always wires one.
+        self._critic = critic
         self._assembler = ContextAssembler(
             memory.events, memory, config.context_budget_chars
         )
@@ -269,15 +274,31 @@ class Orchestrator:
                 if decision is Decision.ASK:
                     approval_id = ulid()
                     fut = self._approvals.create(approval_id)
-                    yield StreamEvent(
-                        "approval_request",
-                        {
-                            "approval_id": approval_id,
-                            "tool": tc.name,
-                            "args": tc.arguments,
-                            "reason": verdict.reason,
-                        },
-                    )
+                    card: dict[str, Any] = {
+                        "approval_id": approval_id,
+                        "tool": tc.name,
+                        "args": tc.arguments,
+                        "reason": verdict.reason,
+                    }
+                    # An independent brain reviews the action before the card is
+                    # shown, so a mismatch / overreach / injection-driven action is
+                    # flagged rather than rubber-stamped. Advisory: the user decides.
+                    if self._critic is not None:
+                        assessment = await self._critic.review(
+                            user_request=user_input,
+                            tool=tc.name,
+                            args=tc.arguments,
+                            tainted=tainted_turn,
+                        )
+                        card["critic_sound"] = assessment.sound
+                        card["critic_note"] = assessment.note
+                        self._traces.span(
+                            turn_id,
+                            "critic",
+                            {"tool": tc.name, "sound": assessment.sound, "note": assessment.note},
+                            parent_id=span,
+                        )
+                    yield StreamEvent("approval_request", card)
                     try:
                         approved, scope = await asyncio.wait_for(fut, timeout=600.0)
                     except TimeoutError:

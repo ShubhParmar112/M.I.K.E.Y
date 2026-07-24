@@ -22,6 +22,7 @@ from core.ingest.files import FileIngestor
 from core.memory.store import MemoryStore
 from core.models.fake_adapter import FakeAdapter
 from core.models.gateway import ModelAdapter, ModelGateway
+from core.orchestrator.critic import Critic
 from core.orchestrator.loop import ApprovalRegistry, Orchestrator, stream_event_json
 from core.policy.engine import PolicyEngine
 from core.storage.db import Database
@@ -69,6 +70,37 @@ def _make_fallbacks(config: Config) -> list[ModelAdapter]:
     return chain
 
 
+def _make_routes(config: Config) -> dict[str, ModelAdapter]:
+    """Pin the configured brains to the local model (sovereignty S2). Config lists
+    brain names (conversation, memory, critic, ...); we resolve each to its
+    capability — the key RoutingMeta carries — so the gateway serves it locally,
+    with cloud fallback preserved. Empty unless MIKEY_LOCAL_BRAINS is set."""
+    if not config.local_brains:
+        return {}
+    from core.models.ollama_adapter import OllamaAdapter
+    from core.orchestrator.brains import BRAINS
+
+    local = OllamaAdapter(config.ollama_base_url, config.ollama_model)
+    routes: dict[str, ModelAdapter] = {}
+    for name in config.local_brains:
+        brain = BRAINS.get(name)
+        if brain is not None:
+            routes[brain.capability] = local
+    return routes
+
+
+def _make_gateway(config: Config, adapter: ModelAdapter | None = None) -> ModelGateway:
+    """The one place a real gateway is assembled — used by the server and the CLI
+    planner alike, so both honor the same primary/fallback chain and S2 routes."""
+    if adapter is not None:
+        return ModelGateway(adapter)
+    return ModelGateway(
+        _make_adapter(config),
+        fallbacks=_make_fallbacks(config),
+        routes=_make_routes(config),
+    )
+
+
 def build_id() -> str:
     """Short git hash of the running code, so a stale gateway is identifiable."""
     try:
@@ -108,12 +140,12 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
     approvals = ApprovalRegistry()
     executor = ExecutorClient(config.workspace)
     # A caller-supplied adapter (tests) runs solo; the real server gets the
-    # cloud→local hybrid so a rate limit or dropped connection isn't fatal.
-    if adapter is not None:
-        gateway = ModelGateway(adapter)
-    else:
-        gateway = ModelGateway(_make_adapter(config), fallbacks=_make_fallbacks(config))
-    orch = Orchestrator(config, memory, traces, policy, gateway, executor, approvals)
+    # cloud→local hybrid + any per-brain S2 routes so a rate limit or dropped
+    # connection isn't fatal and localized brains are served locally.
+    gateway = _make_gateway(config, adapter)
+    orch = Orchestrator(
+        config, memory, traces, policy, gateway, executor, approvals, critic=Critic(gateway)
+    )
 
     app = FastAPI(title="M.I.K.E.Y Gateway", version="0.1.0")
     app.state.policy = policy
@@ -189,6 +221,8 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
             "ok": True,
             "provider": gateway.provider,
             "fallback": gateway.fallback_provider,
+            "local_brains": list(config.local_brains),  # brains served on-device (S2)
+            "routed_capabilities": gateway.routed_capabilities,
             "build": build,
             "audit_chain_valid": policy.verify_audit_chain(),
         }
