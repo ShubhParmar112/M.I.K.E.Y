@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import typer
@@ -23,6 +23,9 @@ from rich.table import Table
 from rich.tree import Tree
 
 from core.config import CONFIG
+
+if TYPE_CHECKING:
+    from core.orchestrator.loop import ApprovalRegistry, StreamEvent
 
 app = typer.Typer(help="M.I.K.E.Y — personal AI cognitive operating system (Gen 1)")
 console = Console()
@@ -104,12 +107,15 @@ def _fallback_subtitle(ev: dict[str, Any], primary: str) -> str | None:
 
 def _handle_approval(client: httpx.Client, ev: dict[str, Any]) -> None:
     args = json.dumps(ev.get("args", {}), ensure_ascii=False)
+    body = f"[bold]{ev['tool']}[/bold]\n{args}\n[dim]{ev.get('reason', '')}[/dim]"
+    # A second brain's read of the action, when present (S1 critic).
+    note = ev.get("critic_note")
+    if note:
+        color = "green" if ev.get("critic_sound") else "red"
+        label = "critic" if ev.get("critic_sound") else "CRITIC ⚠"
+        body += f"\n[{color}]{label}: {note}[/{color}]"
     console.print(
-        Panel(
-            f"[bold]{ev['tool']}[/bold]\n{args}\n[dim]{ev.get('reason', '')}[/dim]",
-            title="approval required",
-            border_style="yellow",
-        )
+        Panel(body, title="approval required", border_style="yellow")
     )
     answer = console.input("[yellow]approve? \\[y]es / \\[n]o / \\[s]ession: [/yellow]").strip().lower()
     approved = answer in ("y", "yes", "s", "session")
@@ -130,6 +136,9 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
     provider_line = f"provider: [bold]{health['provider']}[/bold]"
     if fallback:
         provider_line += f" [dim](+{fallback} fallback)[/dim]"
+    local_brains = health.get("local_brains") or []
+    if local_brains:
+        provider_line += f" [green](local: {', '.join(local_brains)})[/green]"
     console.print(
         Panel(
             f"{provider_line} · "
@@ -518,6 +527,245 @@ def reasoning_eval_cmd(
         detail = r.error or r.detail
         table.add_row(f"{mark} {r.id}", r.category, ",".join(r.tools_called) or "-", detail[:60])
     console.print(table)
+
+
+@app.command("plan")
+def plan_cmd(
+    goal: str = typer.Argument(..., help="the multi-step goal to plan"),
+    run: bool = typer.Option(False, "--run", help="run the mission immediately after planning"),
+) -> None:
+    """Decompose a goal into a durable, executable mission plan (sovereignty S1)."""
+    import asyncio
+
+    from core.events.store import EventStore
+    from core.gateway.app import _make_gateway
+    from core.missions.store import MissionStore
+    from core.orchestrator.planner import Planner
+    from core.storage.db import Database
+
+    CONFIG.ensure_dirs()
+    result = asyncio.run(Planner(_make_gateway(CONFIG)).plan(goal))
+    if not result.ok:
+        console.print(f"[red]could not produce a plan:[/red] {result.notes}")
+        raise typer.Exit(1)
+
+    table = Table(show_header=True, header_style="bold", title=f"plan · {goal}")
+    table.add_column("#")
+    table.add_column("tool")
+    table.add_column("args")
+    for i, s in enumerate(result.steps):
+        table.add_row(str(i), s.tool, json.dumps(s.args, ensure_ascii=False)[:70])
+    console.print(table)
+    if result.rejected:
+        console.print(f"[yellow]dropped un-runnable steps:[/yellow] {', '.join(result.rejected)}")
+
+    db = Database(CONFIG.db_path)
+    try:
+        mission = MissionStore(EventStore(db), CONFIG.device_id).create(goal, result.steps)
+    finally:
+        db.close()
+    console.print(f"[green]created mission[/green] {mission.id} · {len(result.steps)} steps")
+    if run:
+        _run_mission(mission.id)
+    else:
+        console.print(f"[dim]run it with:[/dim] mikey mission-run {mission.id}")
+
+
+@app.command("missions")
+def missions_cmd() -> None:
+    """List unfinished (resumable) missions."""
+    from core.events.store import EventStore
+    from core.missions.store import MissionStore
+    from core.storage.db import Database
+
+    CONFIG.ensure_dirs()
+    db = Database(CONFIG.db_path)
+    try:
+        active = MissionStore(EventStore(db), CONFIG.device_id).active()
+    finally:
+        db.close()
+    if not active:
+        console.print("[dim]no active missions[/dim]")
+        return
+    for m in active:
+        console.print(
+            f"[bold]{m.id}[/bold] · {m.status} · step {m.next_step}/{len(m.steps)} · {m.goal}"
+        )
+
+
+@app.command("mission-run")
+def mission_run_cmd(mission_id: str = typer.Argument(..., help="mission id to run/resume")) -> None:
+    """Run (or resume after a reboot) a durable mission, approving steps as they come."""
+    _run_mission(mission_id)
+
+
+def _run_mission(mission_id: str) -> None:
+    import asyncio
+
+    from core.events.store import EventStore
+    from core.executor_client import ExecutorClient
+    from core.missions.runner import MissionRunner
+    from core.missions.store import MissionStore
+    from core.orchestrator.loop import ApprovalRegistry
+    from core.policy.engine import PolicyEngine
+    from core.storage.db import Database
+
+    async def _drive() -> None:
+        db = Database(CONFIG.db_path)
+        approvals = ApprovalRegistry()
+        executor = ExecutorClient(CONFIG.workspace)
+        try:
+            missions = MissionStore(EventStore(db), CONFIG.device_id)
+            policy = PolicyEngine(db)
+            runner = MissionRunner(CONFIG, missions, policy, executor, approvals)
+            async for ev in runner.run(mission_id):
+                _render_mission_event(ev, approvals)
+        finally:
+            await executor.close()
+            db.close()
+
+    asyncio.run(_drive())
+
+
+def _render_mission_event(ev: StreamEvent, approvals: ApprovalRegistry) -> None:
+    if ev.kind == "status":
+        console.print(
+            f"[dim]mission: {ev.data.get('goal', '')} · "
+            f"resuming at {ev.data.get('resuming_at')}/{ev.data.get('total')}[/dim]"
+        )
+    elif ev.kind == "action":
+        args = json.dumps(ev.data.get("args", {}), ensure_ascii=False)[:80]
+        console.print(f"[dim]→ step {ev.data['step']}: {ev.data['tool']} {args}[/dim]")
+    elif ev.kind == "approval_request":
+        console.print(
+            Panel(
+                f"[bold]{ev.data['tool']}[/bold]\n"
+                f"{json.dumps(ev.data.get('args', {}), ensure_ascii=False)}",
+                title=f"approve step {ev.data['step']}?",
+                border_style="yellow",
+            )
+        )
+        ans = console.input("[yellow]approve? \\[y]es / \\[n]o / \\[s]ession: [/yellow]").strip().lower()
+        approved = ans in ("y", "yes", "s", "session")
+        scope = "session" if ans in ("s", "session") else "once"
+        approvals.resolve(ev.data["approval_id"], approved, scope)
+    elif ev.kind == "action_result":
+        mark = "[green]ok[/green]" if ev.data["ok"] else "[red]failed[/red]"
+        console.print(f"[dim]← step {ev.data['step']} {mark}[/dim]")
+    elif ev.kind == "final":
+        console.print(f"[green]mission {ev.data.get('status', 'done')}[/green]")
+    elif ev.kind == "error":
+        console.print(f"[red]{ev.data['message']}[/red]")
+
+
+def _ollama_models(base_url: str) -> list[str] | None:
+    """Names of models Ollama has pulled, or None if Ollama isn't reachable."""
+    try:
+        resp = httpx.get(f"{base_url.rstrip('/')}/api/tags", timeout=3.0)
+        resp.raise_for_status()
+        return [str(m["name"]) for m in resp.json().get("models", [])]
+    except (httpx.HTTPError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _model_pulled(pulled: list[str], requested: str) -> bool:
+    """True if `requested` (with or without a :tag) matches a pulled model."""
+    base = requested.split(":")[0]
+    return any(n == requested or n.split(":")[0] == base for n in pulled)
+
+
+# Brains whose local quality holds up on a small CPU model vs those that need the
+# cloud (or a real GPU) until a strong local model exists.
+_LIGHT_BRAINS = {"conversation", "critic"}
+
+
+@app.command()
+def doctor() -> None:
+    """Check M.I.K.E.Y's setup: cloud providers, the local model host, which brains
+    run where, and store integrity. Reads config + Ollama + the DB directly — no
+    running gateway needed."""
+    from core.orchestrator.brains import BRAINS
+
+    console.print(
+        Panel(
+            f"home: {CONFIG.home}\nworkspace: {CONFIG.workspace}\n"
+            f"db: {CONFIG.db_path} "
+            + ("[green]exists[/green]" if CONFIG.db_path.exists() else "[yellow]not created yet[/yellow]"),
+            title="environment",
+        )
+    )
+
+    keys = [k for k in ("GROQ", "ANTHROPIC") if os.environ.get(f"{k}_API_KEY")]
+    console.print(
+        Panel(
+            f"primary provider: [bold]{CONFIG.provider}[/bold]\n"
+            f"api keys set: {', '.join(keys) or '[yellow]none[/yellow]'}\n"
+            f"cloud->local fallback: {'on' if CONFIG.local_fallback else 'off'}",
+            title="cloud models",
+        )
+    )
+
+    pulled = _ollama_models(CONFIG.ollama_base_url)
+    if pulled is None:
+        console.print(
+            Panel(
+                "[red]not reachable[/red] — start Ollama to serve any local brain or embeddings",
+                title=f"local host (ollama @ {CONFIG.ollama_base_url})",
+                border_style="red",
+            )
+        )
+    else:
+        def mark(m: str) -> str:
+            return (
+                "[green]pulled[/green]" if _model_pulled(pulled, m)
+                else f"[yellow]missing — run: ollama pull {m}[/yellow]"
+            )
+
+        console.print(
+            Panel(
+                f"reachable · {len(pulled)} model(s) pulled\n"
+                f"local-brain model ({CONFIG.ollama_model}): {mark(CONFIG.ollama_model)}\n"
+                f"embedding model ({CONFIG.embed_model}): {mark(CONFIG.embed_model)}",
+                title=f"local host (ollama @ {CONFIG.ollama_base_url})",
+                border_style="green",
+            )
+        )
+
+    table = Table(show_header=True, header_style="bold", title="brains")
+    table.add_column("brain")
+    table.add_column("capability")
+    table.add_column("served by")
+    table.add_column("note")
+    for b in BRAINS.values():
+        is_local = b.name in CONFIG.local_brains or CONFIG.provider == "ollama"
+        served = (
+            f"[green]local[/green] ({CONFIG.ollama_model})" if is_local
+            else f"cloud ({CONFIG.provider})"
+        )
+        if is_local and pulled is not None and not _model_pulled(pulled, CONFIG.ollama_model):
+            served += " [red](model missing)[/red]"
+        note = (
+            "light — fine to localize" if b.name in _LIGHT_BRAINS
+            else "reasoning — keep on cloud on a CPU box"
+        )
+        table.add_row(b.name, b.capability, served, note)
+    table.add_row("router", "route", "[green]local[/green] (heuristic)", "no model — always local")
+    console.print(table)
+    if CONFIG.local_brains:
+        console.print(f"[dim]MIKEY_LOCAL_BRAINS = {', '.join(CONFIG.local_brains)}[/dim]")
+
+    if CONFIG.db_path.exists():
+        from core.policy.engine import PolicyEngine
+        from core.storage.db import Database
+
+        db = Database(CONFIG.db_path)
+        try:
+            valid = PolicyEngine(db).verify_audit_chain()
+        finally:
+            db.close()
+        console.print(
+            f"audit chain: {'[green]valid[/green]' if valid else '[red]BROKEN[/red]'}"
+        )
 
 
 def main() -> None:
