@@ -13,6 +13,7 @@ from core.events.schema import ulid
 
 class OllamaAdapter:
     name = "ollama"
+    local = True  # runs on-device; the Gateway may serve Tier-0 data here
 
     def __init__(
         self,

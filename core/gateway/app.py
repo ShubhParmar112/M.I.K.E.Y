@@ -28,16 +28,20 @@ from core.storage.db import Database
 from core.trace.store import TraceStore
 
 
-def _make_adapter(config: Config) -> ModelAdapter:
-    if config.provider == "anthropic":
+def _make_adapter(config: Config, provider: str | None = None) -> ModelAdapter:
+    """Build the adapter for `provider` (default: the configured one). The
+    override lets tooling — e.g. `mikey reasoning-eval --against ollama` — build a
+    second provider's adapter to shadow-compare, without touching config."""
+    provider = provider or config.provider
+    if provider == "anthropic":
         from core.models.anthropic_adapter import AnthropicAdapter
 
         return AnthropicAdapter(config.anthropic_model)
-    if config.provider == "groq":
+    if provider == "groq":
         from core.models.groq_adapter import GroqAdapter
 
         return GroqAdapter(config.groq_model)
-    if config.provider == "ollama":
+    if provider == "ollama":
         from core.models.ollama_adapter import OllamaAdapter
 
         return OllamaAdapter(config.ollama_base_url, config.ollama_model)

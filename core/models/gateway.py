@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from core.events.schema import Tier
+
 
 @dataclass
 class ToolCall:
@@ -35,6 +37,23 @@ class ModelResponse:
     usage: dict[str, int] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class RoutingMeta:
+    """Per-request routing hints (architecture 02 §8; ADR-001's
+    `complete(request, {tier, capability, budget})`). Carried by the Gateway,
+    NOT the adapters — adapters never see it, so adding it breaks nothing.
+
+    Sovereignty S0: only `tier` is enforced today (T0 → local-only, §3 privacy).
+    `capability` and `budget` are recorded now and become routing inputs when the
+    Router brain and hybrid routing land (sovereignty S1/S3). Absent meta ==
+    today's behavior exactly: a T1 request down the existing fallback chain.
+    """
+
+    tier: Tier = Tier.T1
+    capability: str = "general"  # e.g. "plan" | "code" | "recall" | "chat"
+    max_output_tokens: int | None = None  # budget hint; None = adapter default
+
+
 class ModelUnavailable(Exception):
     """A provider could not serve the request for a reason another provider might
     survive — rate limits (429), 5xx, or the host being unreachable/offline.
@@ -53,6 +72,10 @@ class ModelUnavailable(Exception):
 
 class ModelAdapter(Protocol):
     name: str
+    # Optional convention (read via getattr, default False): True means the
+    # adapter runs entirely on-device (no data leaves the machine). The Gateway
+    # uses it to enforce the Tier-0 privacy rule. Cloud adapters omit it or set
+    # it False; the local (Ollama) and fake adapters set it True.
 
     async def complete(
         self,
@@ -60,6 +83,10 @@ class ModelAdapter(Protocol):
         messages: list[ChatMessage],
         tools: list[dict[str, Any]],
     ) -> ModelResponse: ...
+
+
+def _is_local(adapter: ModelAdapter) -> bool:
+    return bool(getattr(adapter, "local", False))
 
 
 class ModelGateway:
@@ -98,10 +125,25 @@ class ModelGateway:
         system: str,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]],
+        meta: RoutingMeta | None = None,
     ) -> ModelResponse:
         self.total_calls += 1
+        candidates: list[ModelAdapter] = [self._adapter, *self._fallbacks]
+
+        # Tier-0 privacy is a HARD constraint enforced here, not by convention
+        # (architecture 02 §3): private data may only be served by a local model.
+        # Refusing is the correct failure — leaking T0 to the cloud is not.
+        if meta is not None and meta.tier is Tier.T0:
+            candidates = [a for a in candidates if _is_local(a)]
+            if not candidates:
+                raise RuntimeError(
+                    "refusing to serve Tier-0 (private) data: no local model is "
+                    "configured. T0 must never reach a cloud provider — install/start "
+                    "Ollama (or set MIKEY_PROVIDER=ollama) so private turns stay on-device."
+                )
+
         errors: list[ModelUnavailable] = []
-        for adapter in (self._adapter, *self._fallbacks):
+        for adapter in candidates:
             try:
                 resp = await adapter.complete(system, messages, tools)
                 self.last_provider = adapter.name

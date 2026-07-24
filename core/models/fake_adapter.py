@@ -9,6 +9,7 @@ from core.models.gateway import ChatMessage, ModelResponse
 
 class FakeAdapter:
     name = "fake"
+    local = True  # offline/deterministic; treated as on-device for Tier-0 routing
 
     def __init__(self, script: list[ModelResponse] | None = None) -> None:
         self._script = list(script or [])

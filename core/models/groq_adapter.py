@@ -59,6 +59,7 @@ def _retry_after(resp: httpx.Response) -> float | None:
 
 class GroqAdapter:
     name = "groq"
+    local = False  # cloud provider; never eligible to serve Tier-0 data
 
     def __init__(
         self,

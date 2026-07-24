@@ -20,6 +20,7 @@ def _retry_after(exc: anthropic.APIStatusError) -> float | None:
 
 class AnthropicAdapter:
     name = "anthropic"
+    local = False  # cloud provider; never eligible to serve Tier-0 data
 
     def __init__(self, model: str, client: AsyncAnthropic | None = None) -> None:
         self._client = client or AsyncAnthropic()  # reads ANTHROPIC_API_KEY

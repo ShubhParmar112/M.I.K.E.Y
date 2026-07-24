@@ -1,0 +1,15 @@
+{
+  "_comment": "End-to-end tool-use golden set (sovereignty S0). Each case scores ONE model call given the real system prompt + TOOLS: did the model reach for the right tool (or correctly answer with none)? This is the instrument that decides whether a local brain is good enough to replace a cloud one — grow it from your own real corrections. `expect_tool`: the tool the model should call. `expect_no_tool`: true when a plain reply is correct (greetings, arithmetic). `expect_contains`: substrings that must appear in the reply text (lowercased match).",
+  "cases": [
+    {"id": "greet", "input": "hey mikey, morning", "expect_no_tool": true, "category": "chat"},
+    {"id": "smalltalk", "input": "how are you doing today?", "expect_no_tool": true, "category": "chat"},
+    {"id": "arithmetic", "input": "what's 17 times 3?", "expect_no_tool": true, "expect_contains": ["51"], "category": "chat"},
+    {"id": "recall_past", "input": "what did I tell you earlier about my thesis advisor?", "expect_tool": "memory_recall", "category": "memory"},
+    {"id": "recall_pref", "input": "remind me which cloud model we decided to use", "expect_tool": "memory_recall", "category": "memory"},
+    {"id": "remember_fact", "input": "remember that my paper deadline is November 15th", "expect_tool": "memory_remember", "category": "memory"},
+    {"id": "list_workspace", "input": "what files are in my workspace?", "expect_tool": "fs_list", "category": "tool"},
+    {"id": "read_file", "input": "read the file notes.md and summarise it", "expect_tool": "fs_read", "category": "tool"},
+    {"id": "fetch_url", "input": "fetch https://example.com and tell me the page title", "expect_tool": "web_fetch", "category": "tool"},
+    {"id": "ingest_pdf", "input": "ingest the pdf at C:/papers/mmp.pdf into your memory", "expect_tool": "ingest", "category": "tool"}
+  ]
+}

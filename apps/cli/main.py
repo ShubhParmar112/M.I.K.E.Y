@@ -407,6 +407,114 @@ def run_eval_cmd(
         console.print("[dim]baseline updated[/dim]")
 
 
+@app.command("export")
+def export_cmd(
+    out: str = typer.Option(None, help="output dir (default: <MIKEY_HOME>/datasets)"),
+    include_t0: bool = typer.Option(
+        False, "--include-t0", help="include Tier-0 (private) turns — for on-device training only"
+    ),
+) -> None:
+    """Export the event log into per-brain training datasets (sovereignty S0).
+
+    Read-only over the log; respects tombstones (forgotten memories never appear)
+    and privacy tiers (Tier-0 excluded unless --include-t0)."""
+    from core.events.store import EventStore
+    from core.storage.db import Database
+    from training.exporter import TrainingExporter
+
+    CONFIG.ensure_dirs()  # so the store opens whether or not MIKEY_HOME exists yet
+    out_dir = Path(out) if out else CONFIG.home / "datasets"
+    db = Database(CONFIG.db_path)
+    try:
+        s = TrainingExporter(EventStore(db)).export(out_dir, include_t0=include_t0)
+    finally:
+        db.close()
+    console.print(
+        Panel(
+            f"[green]exported[/green] to {s.out_dir}\n"
+            f"conversation: [bold]{s.conversation}[/bold] · "
+            f"tool-use: [bold]{s.tool_use}[/bold] · "
+            f"memory: [bold]{s.memory}[/bold]  (from {s.turns_seen} turns)\n"
+            f"[dim]skipped Tier-0: {s.skipped_t0_turns} turns, {s.skipped_t0_notes} notes[/dim]",
+            title="M.I.K.E.Y training export",
+        )
+    )
+
+
+@app.command("reasoning-eval")
+def reasoning_eval_cmd(
+    against: str = typer.Option(
+        None, help="provider to shadow-compare against, e.g. ollama (cloud vs local)"
+    ),
+) -> None:
+    """Score tool-use reasoning on the golden set; optionally shadow-compare a
+    second provider (sovereignty S0). Promotes nothing — it only measures."""
+    import asyncio
+
+    from core.eval.reasoning import load_reasoning_golden, run_reasoning_eval, shadow_compare
+    from core.gateway.app import _make_adapter
+
+    cases = load_reasoning_golden()
+    primary = _make_adapter(CONFIG)
+
+    def _cats(report: Any) -> str:
+        return " · ".join(f"{c} {r:.0%}" for c, r in sorted(report.by_category.items()))
+
+    if against:
+        rep = asyncio.run(shadow_compare(primary, _make_adapter(CONFIG, against), cases))
+        inc, cand = rep.incumbent, rep.candidate
+        console.print(
+            Panel(
+                f"incumbent [bold]{inc.adapter}[/bold] {inc.pass_rate:.0%} "
+                f"vs candidate [bold]{cand.adapter}[/bold] {cand.pass_rate:.0%}\n"
+                f"agreement [bold]{rep.agreement:.0%}[/bold] · "
+                f"regressions {rep.regressions or 'none'} · "
+                f"improvements {rep.improvements or 'none'}\n"
+                f"[dim]shadow only — nothing promoted[/dim]",
+                title="reasoning shadow compare",
+                border_style="cyan",
+            )
+        )
+        def _mark(r: Any) -> str:
+            return "[green]ok[/green]" if r and r.passed else "[red]XX[/red]"
+
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("case")
+        table.add_column(inc.adapter)
+        table.add_column(cand.adapter)
+        cand_by_id = {r.id: r for r in cand.results}
+        for a in inc.results:
+            b = cand_by_id.get(a.id)
+            table.add_row(
+                a.id,
+                f"{_mark(a)} {','.join(a.tools_called) or '-'}",
+                f"{_mark(b)} {','.join(b.tools_called) if b else '-'}",
+            )
+        console.print(table)
+        return
+
+    rep_one = asyncio.run(run_reasoning_eval(primary, cases))
+    console.print(
+        Panel(
+            f"pass [bold]{rep_one.pass_rate:.0%}[/bold] "
+            f"({sum(r.passed for r in rep_one.results)}/{rep_one.n}) · "
+            f"adapter [bold]{rep_one.adapter}[/bold]\n{_cats(rep_one)}",
+            title="reasoning eval",
+            border_style="green" if rep_one.pass_rate >= 0.8 else "yellow",
+        )
+    )
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("case")
+    table.add_column("result")
+    table.add_column("tools called")
+    table.add_column("detail")
+    for r in rep_one.results:
+        mark = "[green]ok[/green]" if r.passed else "[red]XX[/red]"
+        detail = r.error or r.detail
+        table.add_row(f"{mark} {r.id}", r.category, ",".join(r.tools_called) or "-", detail[:60])
+    console.print(table)
+
+
 def main() -> None:
     if os.environ.get("MIKEY_SANDBOXED") == "1":
         # Running inside M.I.K.E.Y's own executor sandbox: refuse recursion.
