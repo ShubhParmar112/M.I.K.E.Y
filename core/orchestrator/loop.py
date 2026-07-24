@@ -15,12 +15,13 @@ from typing import Any, AsyncIterator
 
 from core.config import Config
 from core.context.assembly import ContextAssembler
-from core.events.schema import Event, EventType, Provenance, ulid
+from core.events.schema import Event, EventType, Provenance, Tier, ulid
 from core.executor_client import ExecResult, ExecutorClient
 from core.memory.store import MemoryStore
 from core.models.gateway import ChatMessage, ModelGateway, RoutingMeta
 from core.orchestrator.brains import Router
 from core.orchestrator.critic import Critic
+from core.orchestrator.tiering import classify_tier
 from core.policy.engine import ActionRequest, Decision, PolicyEngine
 from core.trace.store import TraceStore
 
@@ -93,9 +94,14 @@ class Orchestrator:
         # memory_forget — while anything actionable goes to the full operator.
         routing = self._router.route(user_input)
         brain = routing.brain
+        # Classify privacy tier (S3): a plainly-private turn is Tier-0 — forced
+        # on-device by the gateway and excluded from cloud training. The tier tags
+        # every event of this turn, so the log itself carries the sensitivity.
+        tier = classify_tier(user_input) if self._config.tier_classify else Tier.T1
         yield StreamEvent(
             "status",
-            {"turn_id": turn_id, "provider": self._gateway.provider, "brain": brain.name},
+            {"turn_id": turn_id, "provider": self._gateway.provider,
+             "brain": brain.name, "tier": tier.value},
         )
 
         # Assemble BEFORE recording the new user message, or it would appear in
@@ -106,6 +112,7 @@ class Orchestrator:
             Event(
                 type=EventType.USER_MESSAGE.value,
                 device=self._config.device_id,
+                tier=tier,
                 payload={
                     "text": user_input, "session_id": session_id,
                     "turn_id": turn_id, "brain": brain.name,
@@ -130,12 +137,15 @@ class Orchestrator:
         self._traces.span(
             turn_id,
             "route",
-            {"brain": brain.name, "capability": brain.capability, "reason": routing.reason},
+            {"brain": brain.name, "capability": brain.capability,
+             "reason": routing.reason, "tier": tier.value},
             parent_id=root,
         )
 
         brain_tools = brain.tools
-        meta = RoutingMeta(tier=brain.tier, capability=brain.capability)
+        # The classified tier (not the brain's default) drives routing: a T0 turn
+        # is served locally regardless of which brain handles it.
+        meta = RoutingMeta(tier=tier, capability=brain.capability)
         messages = ctx.messages
         # Once untrusted content enters — via retrieved memories or fetched data —
         # later actions are tainted and auto-allows escalate to asking the user.
@@ -168,6 +178,7 @@ class Orchestrator:
                     Event(
                         type=EventType.ASSISTANT_MESSAGE.value,
                         device=self._config.device_id,
+                        tier=tier,
                         provenance=Provenance(source="agent", trusted=True),
                         payload={
                             "text": resp.text, "session_id": session_id,
@@ -289,6 +300,7 @@ class Orchestrator:
                             tool=tc.name,
                             args=tc.arguments,
                             tainted=tainted_turn,
+                            tier=tier,  # a private turn's review also stays on-device
                         )
                         card["critic_sound"] = assessment.sound
                         card["critic_note"] = assessment.note
@@ -326,7 +338,7 @@ class Orchestrator:
                     try:
                         if tc.name in INPROCESS_TOOLS:
                             result = self._call_inprocess_tool(
-                                tc.name, tc.arguments, tainted_turn, turn_id
+                                tc.name, tc.arguments, tainted_turn, turn_id, tier
                             )
                         else:
                             result = await self._executor.call(tc.name, tc.arguments)
@@ -345,6 +357,7 @@ class Orchestrator:
                         Event(
                             type=EventType.ACTION_EXECUTED.value,
                             device=self._config.device_id,
+                            tier=tier,
                             provenance=Provenance(source="agent", trusted=True),
                             payload={
                                 "tool": tc.name,
@@ -376,7 +389,8 @@ class Orchestrator:
         )
 
     def _call_inprocess_tool(
-        self, name: str, args: dict[str, Any], tainted: bool, turn_id: str
+        self, name: str, args: dict[str, Any], tainted: bool, turn_id: str,
+        tier: Tier = Tier.T1,
     ) -> ExecResult:
         """In-process memory tools. Recall returns provenance-annotated hits and
         taints the turn if any hit is untrusted; remember persists a durable note
@@ -416,6 +430,7 @@ class Orchestrator:
                 trusted=not tainted,
                 turn_id=turn_id,
                 device=self._config.device_id,
+                tier=tier,  # a fact stated on a private turn is remembered as T0
                 supersedes=[str(s) for s in supersedes] if supersedes else None,
             )
             if result.status == "duplicate":

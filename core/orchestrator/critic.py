@@ -18,6 +18,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from core.events.schema import Tier
 from core.models.gateway import ChatMessage, ModelGateway, RoutingMeta
 from core.orchestrator.brains import CRITIC
 
@@ -33,7 +34,8 @@ class Critic:
         self._gateway = gateway
 
     async def review(
-        self, *, user_request: str, tool: str, args: dict[str, Any], tainted: bool
+        self, *, user_request: str, tool: str, args: dict[str, Any], tainted: bool,
+        tier: Tier = Tier.T1,
     ) -> Verdict:
         detail = (
             f"User's request: {user_request}\n\n"
@@ -50,9 +52,8 @@ class Critic:
                 CRITIC.system_prompt,
                 [ChatMessage(role="user", text=detail)],
                 [],
-                # T1 for now; when turns carry a tier, the critic should inherit it so a
-                # private turn's review also stays on-device.
-                RoutingMeta(tier=CRITIC.tier, capability=CRITIC.capability),
+                # Inherit the turn's tier: a private turn's review stays on-device too.
+                RoutingMeta(tier=tier, capability=CRITIC.capability),
             )
         except Exception:
             # Advisory only: a verifier that is down must never block the turn.

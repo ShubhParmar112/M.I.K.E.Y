@@ -190,6 +190,9 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
                             # the toolless conversation brain.
                             if ev.get("brain") and ev["brain"] != "operator":
                                 console.print(f"[dim]· {ev['brain']} brain[/dim]")
+                            # And flag a private turn kept on-device (S3).
+                            if ev.get("tier") == "T0":
+                                console.print("[green]· private — kept on-device[/green]")
                         elif kind == "action":
                             args = json.dumps(ev["args"], ensure_ascii=False)[:120]
                             console.print(f"[dim]→ {ev['tool']} {args}[/dim]{_served_tag(ev, primary)}")
@@ -753,6 +756,12 @@ def doctor() -> None:
     console.print(table)
     if CONFIG.local_brains:
         console.print(f"[dim]MIKEY_LOCAL_BRAINS = {', '.join(CONFIG.local_brains)}[/dim]")
+    console.print(
+        "privacy tiers: "
+        + ("[green]on[/green]" if CONFIG.tier_classify else "[yellow]off[/yellow]")
+        + " - turns with private data (passwords, IDs, health, 'keep this private') "
+        "are forced on-device"
+    )
 
     if CONFIG.db_path.exists():
         from core.policy.engine import PolicyEngine

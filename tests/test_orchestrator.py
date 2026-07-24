@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from core.config import Config
-from core.events.schema import Event, EventType, Provenance, ulid
+from core.events.schema import Event, EventType, Provenance, Tier, ulid
 from core.events.store import EventStore
 from core.executor_client import ExecutorClient
 from core.memory.store import MemoryStore
@@ -553,6 +553,78 @@ async def test_critic_reviews_a_risky_action_before_approval(env) -> None:
     assert "never asked" in card.get("critic_note", "")
     assert "critic" in [s["kind"] for s in traces.turn(turn_id)]  # traced too
     assert not (config.workspace / "x.txt").exists()  # user denied → nothing written
+
+
+async def test_private_turn_is_classified_t0_and_kept_on_device(env) -> None:
+    """S3: a turn with private data is Tier-0 — served by the local model (never the
+    cloud) and tagged T0 on the log (so the exporter excludes it from cloud training)."""
+    config, db = env
+
+    class _Cloud:  # a cloud adapter that must never be reached on a T0 turn
+        name = "cloud"
+        local = False
+
+        async def complete(self, system, messages, tools) -> ModelResponse:  # noqa: ANN001
+            raise AssertionError("Tier-0 data must not reach the cloud")
+
+    local = FakeAdapter([ModelResponse(text="Noted privately.", tool_calls=[])])  # local=True
+    gateway = ModelGateway(_Cloud(), fallbacks=[local])
+    memory = MemoryStore(db, EventStore(db))
+    traces = TraceStore(db)
+    policy = PolicyEngine(db)
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(config, memory, traces, policy, gateway, executor, approvals)
+
+    finals: list[str] = []
+    tier_in_status = ""
+    try:
+        async for ev in orch.run_turn("s1", "my banking password is hunter2, keep it safe"):
+            if ev.kind == "status":
+                tier_in_status = ev.data["tier"]
+            if ev.kind == "final":
+                finals.append(ev.data["text"])
+    finally:
+        await executor.close()
+
+    assert tier_in_status == "T0"
+    assert finals == ["Noted privately."]
+    assert gateway.last_provider == "fake"  # served locally; the cloud was never called
+    user_ev = next(e for e in memory.events.recent() if e.type == EventType.USER_MESSAGE.value)
+    assert user_ev.tier is Tier.T0
+
+
+async def test_benign_turn_stays_t1_and_uses_cloud(env) -> None:
+    config, db = env
+
+    class _Cloud:
+        name = "cloud"
+        local = False
+
+        async def complete(self, system, messages, tools) -> ModelResponse:  # noqa: ANN001
+            return ModelResponse(text="here you go", tool_calls=[])
+
+    local = FakeAdapter([ModelResponse(text="local", tool_calls=[])])
+    gateway = ModelGateway(_Cloud(), fallbacks=[local])
+    memory = MemoryStore(db, EventStore(db))
+    traces = TraceStore(db)
+    policy = PolicyEngine(db)
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(config, memory, traces, policy, gateway, executor, approvals)
+
+    finals: list[str] = []
+    try:
+        async for ev in orch.run_turn("s1", "what is the capital of France?"):
+            if ev.kind == "final":
+                finals.append(ev.data["text"])
+    finally:
+        await executor.close()
+
+    assert finals == ["here you go"]  # the cloud primary served an ordinary turn
+    assert gateway.last_provider == "cloud"
+    user_ev = next(e for e in memory.events.recent() if e.type == EventType.USER_MESSAGE.value)
+    assert user_ev.tier is Tier.T1
 
 
 async def test_plain_answer_no_tools(env) -> None:

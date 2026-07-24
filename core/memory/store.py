@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from core.events.schema import Event, EventType, Provenance, now
+from core.events.schema import Event, EventType, Provenance, Tier, now
 from core.events.store import EventStore
 from core.models.gateway import ModelUnavailable
 from core.storage.db import Database
@@ -260,6 +260,7 @@ class MemoryStore:
         trusted: bool = True,
         turn_id: str = "",
         device: str = "dev_desktop_1",
+        tier: Tier = Tier.T1,
         supersedes: list[str] | None = None,
     ) -> RememberResult:
         """Persist a durable fact while keeping memory clean (Gen 2: contradiction
@@ -300,6 +301,7 @@ class MemoryStore:
             Event(
                 type=EventType.MEMORY_NOTE.value,
                 device=device,
+                tier=tier,
                 provenance=Provenance(source=source, trusted=trusted),
                 payload={"text": text, "turn_id": turn_id, "supersedes": superseded},
             )

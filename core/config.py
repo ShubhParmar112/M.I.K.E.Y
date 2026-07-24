@@ -55,6 +55,12 @@ class Config:
             b.strip() for b in os.environ.get("MIKEY_LOCAL_BRAINS", "").split(",") if b.strip()
         )
     )
+    # Privacy-tier classification (sovereignty S3): mark plainly-private turns Tier-0
+    # so the gateway keeps them on-device and the exporter excludes them from cloud
+    # training. On by default; set MIKEY_TIER_CLASSIFY=0 to treat every turn as T1.
+    tier_classify: bool = field(
+        default_factory=lambda: os.environ.get("MIKEY_TIER_CLASSIFY", "1") != "0"
+    )
     # Semantic retrieval via a local embedding model (degrades to keyword-only if
     # the model/Ollama is unavailable). Set MIKEY_VECTORS=0 to disable entirely.
     local_vectors: bool = field(
