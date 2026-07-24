@@ -93,13 +93,19 @@ class ModelGateway:
     """The one door to any LLM. Given a primary adapter and an ordered chain of
     fallbacks, it serves from the primary and, only when a provider raises
     ModelUnavailable (rate-limited/offline), transparently tries the next link —
-    e.g. groq → claude → local — so a rate limit or outage never kills a turn."""
+    e.g. groq → claude → local — so a rate limit or outage never kills a turn.
+
+    `routes` (sovereignty S2) pins a capability to a preferred adapter — e.g. the
+    critic served by a local model — so brains can be localized one at a time. A
+    routed capability still keeps the default chain behind it as fallback, and the
+    Tier-0 privacy rule always overrides routing."""
 
     def __init__(
         self,
         adapter: ModelAdapter,
         fallback: ModelAdapter | None = None,
         fallbacks: list[ModelAdapter] | None = None,
+        routes: dict[str, ModelAdapter] | None = None,
     ) -> None:
         self._adapter = adapter
         if fallbacks is not None:
@@ -108,9 +114,15 @@ class ModelGateway:
             self._fallbacks = [fallback]
         else:
             self._fallbacks = []
+        self._routes = dict(routes or {})  # capability -> preferred adapter
         self.total_calls = 0
         # Which adapter actually served the last completion (for traces/health).
         self.last_provider = adapter.name
+
+    @property
+    def routed_capabilities(self) -> dict[str, str]:
+        """capability -> adapter name, for health/observability."""
+        return {cap: a.name for cap, a in self._routes.items()}
 
     @property
     def provider(self) -> str:
@@ -128,11 +140,23 @@ class ModelGateway:
         meta: RoutingMeta | None = None,
     ) -> ModelResponse:
         self.total_calls += 1
-        candidates: list[ModelAdapter] = [self._adapter, *self._fallbacks]
+        default_chain: list[ModelAdapter] = [self._adapter, *self._fallbacks]
+
+        # Per-capability routing (S2): a capability pinned to a specific adapter
+        # (e.g. a local model for one brain) leads, with the default chain behind it
+        # as fallback (deduped by name). No route → today's default chain exactly.
+        if meta is not None and meta.capability in self._routes:
+            routed = self._routes[meta.capability]
+            candidates: list[ModelAdapter] = [routed] + [
+                a for a in default_chain if a.name != routed.name
+            ]
+        else:
+            candidates = list(default_chain)
 
         # Tier-0 privacy is a HARD constraint enforced here, not by convention
         # (architecture 02 §3): private data may only be served by a local model.
-        # Refusing is the correct failure — leaking T0 to the cloud is not.
+        # Refusing is the correct failure — leaking T0 to the cloud is not. This
+        # overrides any capability route (a route to a cloud model is dropped for T0).
         if meta is not None and meta.tier is Tier.T0:
             candidates = [a for a in candidates if _is_local(a)]
             if not candidates:

@@ -46,6 +46,15 @@ class Config:
             "MIKEY_FALLBACK_MODEL", os.environ.get("MIKEY_OLLAMA_MODEL", "llama3.2")
         )
     )
+    # Per-brain localization (sovereignty S2): brain names served by the local
+    # model instead of the cloud primary, e.g. MIKEY_LOCAL_BRAINS=conversation,critic.
+    # Cloud fallback is preserved for each. Empty by default — opt in per brain as
+    # its local quality passes the shadow/eval gate (`mikey reasoning-eval`).
+    local_brains: tuple[str, ...] = field(
+        default_factory=lambda: tuple(
+            b.strip() for b in os.environ.get("MIKEY_LOCAL_BRAINS", "").split(",") if b.strip()
+        )
+    )
     # Semantic retrieval via a local embedding model (degrades to keyword-only if
     # the model/Ollama is unavailable). Set MIKEY_VECTORS=0 to disable entirely.
     local_vectors: bool = field(
