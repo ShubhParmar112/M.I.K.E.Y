@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from core.events.schema import EventType
 from core.events.store import EventStore
+from core.memory.provenance import annotate
 from core.memory.store import MemoryHit, MemoryStore
 from core.models.gateway import ChatMessage
 
@@ -52,7 +53,10 @@ pass `supersedes` when remembering the new one instead of forgetting. To read a 
 or PDF, anywhere on disk) into memory, use the `ingest` tool with its path — if the user \
 pastes a `mikey ingest <path>` command, treat it as a request to ingest that path, do not run \
 it as a shell command. Never shell out to the CLI to reach your memory — use these tools.
-- When you use a retrieved memory, cite its source. If memories conflict or may be stale, say so.
+- When you use a retrieved memory, cite where it came from and how old it is — both are shown in \
+its annotation (e.g. "from you · 5 months ago"). If a memory is marked "possibly outdated", or is \
+months old and describes something that changes (a plan, a preference, a deadline), don't state it \
+as current fact: say when they told you and offer to reconfirm. If memories conflict, surface it.
 - Ground facts in sources — do not guess and do not flatter. When the user makes or asks about \
 a factual claim tied to a document or something in your memory, `memory_recall` the relevant \
 source FIRST and answer from what it actually says, citing it. Never just agree with a claim to \
@@ -115,8 +119,7 @@ class ContextAssembler:
                 if total + len(snippet) > MEMORY_BUDGET_CHARS:
                     break
                 total += len(snippet)
-                trust = "trusted" if h.trusted else "UNTRUSTED"
-                lines.append(f"- [{h.event_id} · {h.ts[:10]} · {h.source} · {trust}] {snippet}")
+                lines.append(f"- [{annotate(h)}] {snippet}")
             if lines:
                 system = (
                     base_system

@@ -45,7 +45,8 @@ class EventType(StrEnum):
     ASSISTANT_MESSAGE = "conversation.message.assistant"
     ACTION_EXECUTED = "action.executed"
     INGEST_DOCUMENT = "ingest.document"
-    MEMORY_NOTE = "memory.note"  # a durable fact M.I.K.E.Y was asked to remember
+    MEMORY_NOTE = "memory.note"  # a durable fact M.I.K.E.Y was asked to remember (semantic tier)
+    MEMORY_EPISODE = "memory.episode"  # a summary of what happened in a session (episodic tier)
     MISSION_CREATED = "mission.created"  # a durable multi-step plan
     MISSION_STEP_RESULT = "mission.step.result"  # one step's outcome (durable progress)
 

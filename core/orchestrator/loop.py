@@ -17,6 +17,7 @@ from core.config import Config
 from core.context.assembly import ContextAssembler
 from core.events.schema import Event, EventType, Provenance, Tier, ulid
 from core.executor_client import ExecResult, ExecutorClient
+from core.memory.provenance import annotate
 from core.memory.store import MemoryStore
 from core.models.gateway import ChatMessage, ModelGateway, RoutingMeta
 from core.orchestrator.brains import Router
@@ -411,11 +412,7 @@ class Orchestrator:
             any_untrusted = False
             for h in hits:
                 any_untrusted = any_untrusted or not h.trusted
-                trust = "trusted" if h.trusted else "UNTRUSTED"
-                lines.append(
-                    f"[{h.event_id} · {h.ts[:10]} · {h.source} · {trust}] "
-                    f"{h.text[:MEMORY_SNIPPET_CHARS]}"
-                )
+                lines.append(f"[{annotate(h)}] {h.text[:MEMORY_SNIPPET_CHARS]}")
             return ExecResult(True, "\n".join(lines), any_untrusted)
 
         if name == "memory_remember":

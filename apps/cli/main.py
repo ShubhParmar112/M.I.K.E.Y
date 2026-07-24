@@ -286,12 +286,24 @@ def recall(query: str, k: int = 6) -> None:
     if not hits:
         console.print("[dim]no memories matched[/dim]")
         return
+    from core.events.schema import now as _now
+    from core.memory.provenance import humanize_age, is_stale, source_label
+
+    now = _now()
     for h in hits:
-        trust = "[green]trusted[/green]" if h["trusted"] else "[yellow]untrusted[/yellow]"
+        age = humanize_age(h["ts"], now)
+        src = source_label(h["source"], h["trusted"])
+        kind = h.get("kind", "memory")
+        tier = f"[cyan]{kind}[/cyan] · " if kind in ("fact", "episode", "document") else ""
+        stale = (
+            " · [yellow]possibly outdated[/yellow]"
+            if kind not in ("episode", "document") and is_stale(h["ts"], h["source"], now)
+            else ""
+        )
         console.print(
             Panel(
                 h["text"][:500],
-                title=f"{h['event_id']} · {h['ts'][:10]} · {h['source']} · {trust}",
+                title=f"{h['event_id']} · {tier}{age} · {src}{stale}",
                 border_style="magenta",
             )
         )
@@ -774,6 +786,40 @@ def doctor() -> None:
             db.close()
         console.print(
             f"audit chain: {'[green]valid[/green]' if valid else '[red]BROKEN[/red]'}"
+        )
+
+
+@app.command()
+def consolidate(
+    session: str = typer.Option("default", help="session id to consolidate"),
+    force: bool = typer.Option(False, "--force", help="re-summarize even if already done"),
+) -> None:
+    """Summarize a chat session into an episodic memory — what happened, not just facts."""
+    import asyncio
+
+    from core.events.store import EventStore
+    from core.gateway.app import _make_gateway
+    from core.memory.consolidation import Consolidator
+    from core.memory.store import MemoryStore
+    from core.storage.db import Database
+
+    CONFIG.ensure_dirs()
+    db = Database(CONFIG.db_path)
+    try:
+        memory = MemoryStore(db, EventStore(db))
+        summary = asyncio.run(
+            Consolidator(_make_gateway(CONFIG)).consolidate_session(memory, session, force=force)
+        )
+    finally:
+        db.close()
+    if summary is None:
+        console.print(
+            "[dim]nothing to consolidate (too short, already done, or model unavailable). "
+            "Use --force to redo.[/dim]"
+        )
+    else:
+        console.print(
+            Panel(summary, title=f"episode recorded · session {session}", border_style="green")
         )
 
 

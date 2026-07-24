@@ -198,7 +198,7 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
         return {
             "hits": [
                 {"event_id": h.event_id, "source": h.source, "trusted": h.trusted,
-                 "ts": h.ts, "text": h.text, "rank": h.rank}
+                 "ts": h.ts, "text": h.text, "rank": h.rank, "kind": h.kind}
                 for h in hits
             ]
         }

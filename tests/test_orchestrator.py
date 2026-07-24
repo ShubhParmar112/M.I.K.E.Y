@@ -223,9 +223,9 @@ async def test_untrusted_memory_is_injected_and_taints_the_turn(env) -> None:
     finally:
         await executor.close()
 
-    # (a) memory injected with provenance annotation
+    # (a) memory injected with provenance annotation (source humanized to the filename)
     assert "quantum error correction" in adapter.systems[0]
-    assert "connector:file:seminar.md" in adapter.systems[0]
+    assert "seminar.md" in adapter.systems[0]
     assert "UNTRUSTED" in adapter.systems[0]
     assert doc.id in adapter.systems[0]
     # (b) normally auto-allowed fs_read required approval because turn was tainted
@@ -270,7 +270,7 @@ async def test_remember_then_recall_across_turns(env) -> None:
 
     # the persisted fact came back through the recall tool, carrying provenance
     assert "Pixel" in recall_output
-    assert "trusted" in recall_output
+    assert "from you" in recall_output  # provenance: the user stated it
     assert policy.verify_audit_chain() is True
 
 

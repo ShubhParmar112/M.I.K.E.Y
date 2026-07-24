@@ -65,6 +65,18 @@ PROJECTED_TYPES = {
     EventType.ASSISTANT_MESSAGE.value,
     EventType.INGEST_DOCUMENT.value,
     EventType.MEMORY_NOTE.value,
+    EventType.MEMORY_EPISODE.value,
+}
+
+# Memory tiers (docs/04 §6): the kind of memory a hit is, derived from its event
+# type. `fact` = a durable preference/fact (semantic); `episode` = a summary of
+# what happened (episodic); `document` = ingested reference; `message` = raw turn.
+_TIER_BY_TYPE = {
+    EventType.MEMORY_NOTE.value: "fact",
+    EventType.MEMORY_EPISODE.value: "episode",
+    EventType.INGEST_DOCUMENT.value: "document",
+    EventType.USER_MESSAGE.value: "message",
+    EventType.ASSISTANT_MESSAGE.value: "message",
 }
 
 
@@ -76,6 +88,7 @@ class MemoryHit:
     ts: str
     text: str
     rank: float
+    kind: str = "memory"  # tier: fact | episode | document | message (set on recall)
 
 
 @dataclass
@@ -134,7 +147,15 @@ class MemoryStore:
         """Hybrid retrieval. Keyword catches exact terms; semantic catches
         paraphrase ('who created this' → the authors). Fused with reciprocal-rank
         fusion. Degrades to keyword-only if no embedder is set or it is down, so a
-        missing/paused embedding model never breaks recall."""
+        missing/paused embedding model never breaks recall. Each hit is labeled with
+        its memory tier (fact/episode/document/message)."""
+        hits = self._recall_hits(query, k, exclude_ids)
+        self._label_tiers(hits)
+        return hits
+
+    def _recall_hits(
+        self, query: str, k: int, exclude_ids: set[str] | None
+    ) -> list[MemoryHit]:
         if self._embedder is None:
             return self._keyword_recall(query, k, exclude_ids)
         try:
@@ -145,6 +166,19 @@ class MemoryStore:
         if not semantic:
             return keyword[:k]
         return self._rrf_merge(keyword, semantic, k)
+
+    def _label_tiers(self, hits: list[MemoryHit]) -> None:
+        """Set each hit's tier from its source event type (one query)."""
+        ids = [h.event_id for h in hits]
+        if not ids:
+            return
+        marks = ",".join("?" * len(ids))
+        rows = self._db.conn.execute(
+            f"SELECT id, type FROM events WHERE id IN ({marks})", tuple(ids)
+        ).fetchall()
+        tier = {r["id"]: _TIER_BY_TYPE.get(r["type"], "memory") for r in rows}
+        for h in hits:
+            h.kind = tier.get(h.event_id, "memory")
 
     def _keyword_recall(
         self, query: str, k: int = 6, exclude_ids: set[str] | None = None
@@ -251,6 +285,35 @@ class MemoryStore:
     def recent_notes(self, limit: int = 500) -> list[Event]:
         """Durable memory notes only (excludes tombstoned — EventStore.recent does)."""
         return self._events.recent(types=[EventType.MEMORY_NOTE.value], limit=limit)
+
+    def episode_for(self, session_id: str) -> Event | None:
+        """The existing episodic summary for a session, if any (for idempotency)."""
+        for ev in self._events.recent(types=[EventType.MEMORY_EPISODE.value], limit=100_000):
+            if ev.payload.get("session_id") == session_id:
+                return ev
+        return None
+
+    def record_episode(
+        self,
+        session_id: str,
+        summary: str,
+        *,
+        tier: Tier = Tier.T1,
+        device: str = "dev_desktop_1",
+        turn_ids: list[str] | None = None,
+    ) -> Event:
+        """Record an episodic memory — a summary of what happened in a session.
+        Provenance is `agent` (M.I.K.E.Y wrote it); tier mirrors the session's most
+        sensitive turn so a private session's summary stays on-device too."""
+        return self.record(
+            Event(
+                type=EventType.MEMORY_EPISODE.value,
+                device=device,
+                tier=tier,
+                provenance=Provenance(source="agent", trusted=True),
+                payload={"text": summary, "session_id": session_id, "turns": turn_ids or []},
+            )
+        )
 
     def remember(
         self,
