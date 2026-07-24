@@ -1,16 +1,17 @@
 """The Router (sovereignty S1): which brain handles a turn.
 
 Safety-biased: anything that might need a tool, memory op, action, or a factual
-answer goes to the full operator; only clearly social turns go to the toolless
-conversation brain. The one non-negotiable is the incident class — a goodbye must
-never reach a brain that can touch memory.
+answer goes to the full operator; memory *curation* (forgetting/removing) goes to
+the narrow memory brain; only clearly social turns go to the toolless conversation
+brain. Two non-negotiables: a goodbye must never reach a brain that can touch
+memory, and only the memory brain may forget.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from core.orchestrator.brains import CONVERSATION, OPERATOR, Router
+from core.orchestrator.brains import CONVERSATION, MEMORY, OPERATOR, Router
 from core.orchestrator.tools import TOOLS
 
 
@@ -36,17 +37,31 @@ def test_social_turns_route_to_conversation(router: Router, text: str) -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        "remember that my deadline is Nov 15",
-        "forget what I told you about the wifi",
+        "remember that my deadline is Nov 15",  # appending a fact stays on operator
         "read notes.md and summarise it",
         "run the tests",
-        "what's my dog's name?",          # question → may need memory
-        "how many files are in the repo?",  # question + actiony
+        "what's my dog's name?",             # question → may need memory
+        "how many files are in the repo?",   # question + actiony
         "fetch https://example.com",
+        "delete the temp file in the workspace",  # file delete, NOT memory forget
     ],
 )
 def test_actionable_turns_route_to_operator(router: Router, text: str) -> None:
     assert router.route(text).brain is OPERATOR
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "forget what I told you about the wifi",
+        "forget my old address",
+        "delete that note about the meeting",
+        "erase what you remember about my password",
+        "unremember the deadline",
+    ],
+)
+def test_memory_curation_routes_to_memory_brain(router: Router, text: str) -> None:
+    assert router.route(text).brain is MEMORY
 
 
 def test_goodbye_cannot_reach_a_memory_capable_brain(router: Router) -> None:
@@ -57,7 +72,13 @@ def test_goodbye_cannot_reach_a_memory_capable_brain(router: Router) -> None:
     assert brain.tools == []
 
 
-def test_brain_tool_scoping() -> None:
+def test_only_the_memory_brain_may_forget() -> None:
+    """memory_forget authority is exclusive to the memory brain."""
+    op_tools = {t["name"] for t in OPERATOR.tools}
+    assert "memory_forget" not in op_tools                    # operator can never forget
+    assert op_tools == {t["name"] for t in TOOLS} - {"memory_forget"}
+
+    mem_tools = {t["name"] for t in MEMORY.tools}
+    assert mem_tools == {"memory_recall", "memory_remember", "memory_forget"}
+
     assert CONVERSATION.tools == []
-    assert len(OPERATOR.tools) == len(TOOLS)  # operator keeps the full suite
-    assert {t["name"] for t in OPERATOR.tools} == {t["name"] for t in TOOLS}

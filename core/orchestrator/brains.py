@@ -51,7 +51,29 @@ If it turns out they actually want something done — a lookup, a file change, r
 forgetting a fact — tell them to say so directly and you'll take care of it. Do NOT pretend \
 you've already done it."""
 
+MEMORY_PROMPT = """You are M.I.K.E.Y's memory manager — the ONLY part of the system trusted to \
+change or delete long-term memory. The person has asked you to manage what M.I.K.E.Y remembers, \
+and that is the whole of your job.
+
+- To look something up: use memory_recall and answer with the source and date.
+- To remember: use memory_remember to persist a durable fact the person asked you to keep. If \
+this new fact updates an existing one, pass `supersedes` with the old memory's id (get it from \
+memory_recall) — do NOT delete the old one separately.
+- To forget: use memory_forget ONLY to delete the specific memory the person explicitly asked \
+you to forget. First memory_recall to find its id and confirm it is the right one, then forget \
+that ONE memory. Never forget anything the person did not name. Never delete memories to tidy up, \
+deduplicate, or clean house on your own — that is never your call.
+
+Do one memory operation at a time, deliberately. If you are unsure which memory the person means, \
+ask them rather than guessing. You hold no other tools and take no other actions."""
+
 ALL_TOOL_NAMES = frozenset(t["name"] for t in TOOLS)
+# The operator keeps every tool EXCEPT memory_forget: destroying a memory is
+# authority reserved for the memory brain, so the generalist can never fire it —
+# the durable fix for the live memory_forget cascade.
+OPERATOR_TOOLS = ALL_TOOL_NAMES - {"memory_forget"}
+# The memory brain's narrow charter: read, write, and delete memory, nothing else.
+MEMORY_BRAIN_TOOLS = frozenset({"memory_recall", "memory_remember", "memory_forget"})
 
 
 @dataclass(frozen=True)
@@ -76,7 +98,7 @@ OPERATOR = Brain(
     system_prompt=SYSTEM_PROMPT,
     capability="general",
     tier=Tier.T1,
-    tool_names=ALL_TOOL_NAMES,
+    tool_names=OPERATOR_TOOLS,  # everything except memory_forget
 )
 
 CONVERSATION = Brain(
@@ -87,7 +109,15 @@ CONVERSATION = Brain(
     tool_names=frozenset(),  # no tools: cannot touch memory or the executor
 )
 
-BRAINS: dict[str, Brain] = {b.name: b for b in (OPERATOR, CONVERSATION)}
+MEMORY = Brain(
+    name="memory",
+    system_prompt=MEMORY_PROMPT,
+    capability="memory",
+    tier=Tier.T1,
+    tool_names=MEMORY_BRAIN_TOOLS,  # the only brain that may forget
+)
+
+BRAINS: dict[str, Brain] = {b.name: b for b in (OPERATOR, CONVERSATION, MEMORY)}
 
 
 @dataclass(frozen=True)
@@ -108,6 +138,16 @@ _ACTIONY = re.compile(
     r"code|git|repo|create|make|delete|remove|update|edit|change|fix|"
     r"summari[sz]e|check|calculate|compute"
     r")\b",
+    re.I,
+)
+
+# Intent to delete/curate long-term memory → the memory brain (the only one that
+# may forget). "forget"/"unremember" are unambiguous here; delete/erase/remove/etc.
+# count only when clearly aimed at memory (so "delete the temp file" stays operator).
+_FORGET = re.compile(
+    r"\b(forget|unremember)\b"
+    r"|\b(delete|erase|remove|wipe|scrub|purge|clear)\b[^.?!]*"
+    r"\b(memor|note|fact|remember|told you|you said|you know|about me)\b",
     re.I,
 )
 
@@ -133,6 +173,10 @@ class Router:
 
     def route(self, user_input: str) -> Routing:
         text = user_input.strip()
+        # Forgetting/curating memory is checked first (it's also "actiony"): only
+        # the memory brain holds memory_forget, so this is where those turns must go.
+        if _FORGET.search(text):
+            return Routing(MEMORY, "memory curation — removing/correcting what's stored")
         if _ACTIONY.search(text):
             return Routing(OPERATOR, "request implies a tool, memory op, or action")
         # A question is likely an information need (often memory/facts) — default to

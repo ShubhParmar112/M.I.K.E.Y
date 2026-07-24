@@ -293,19 +293,68 @@ async def test_memory_forget_requires_approval(env) -> None:
     )
 
     asked = False
+    status_brain = ""
     try:
         async for ev in orch.run_turn("s1", "forget the wifi password"):
+            if ev.kind == "status":
+                status_brain = ev.data["brain"]
             if ev.kind == "approval_request" and ev.data["tool"] == "memory_forget":
                 asked = True
                 approvals.resolve(ev.data["approval_id"], approved=True, scope="once")
     finally:
         await executor.close()
 
+    assert status_brain == "memory"  # forgetting is routed to the dedicated memory brain
     assert asked is True
     # the note is verifiably gone (a term unique to it no longer retrieves it)
     assert memory.recall("hunter2") == []
     assert note.event_id not in [h.event_id for h in memory.recall("wifi password")]
     assert policy.verify_audit_chain() is True
+
+
+async def test_operator_is_refused_if_it_tries_to_forget(env) -> None:
+    """Authority is enforced, not merely un-offered (S1 memory brain): if the
+    operator model emits memory_forget anyway, the loop refuses it — no approval
+    card, no deletion — because only the memory brain holds that tool."""
+    config, db = env
+    memory = MemoryStore(db, EventStore(db))
+    note = memory.remember("The wifi password is hunter2.")
+    # A question routes to the operator; the (mis)behaving model tries to forget.
+    script = [
+        ModelResponse(text="", tool_calls=[
+            ToolCall(id=ulid(), name="memory_forget", arguments={"event_id": note.event_id})
+        ]),
+        ModelResponse(text="I can't delete memories in this mode.", tool_calls=[]),
+    ]
+    traces = TraceStore(db)
+    policy = PolicyEngine(db)
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(
+        config, memory, traces, policy, ModelGateway(FakeAdapter(script)), executor, approvals
+    )
+
+    turn_id = ""
+    status_brain = ""
+    approvals_asked = 0
+    refused = False
+    try:
+        async for ev in orch.run_turn("s1", "what's the wifi password?"):
+            if ev.kind == "status":
+                turn_id = ev.data["turn_id"]
+                status_brain = ev.data["brain"]
+            if ev.kind == "approval_request":
+                approvals_asked += 1
+            if ev.kind == "action_result" and "not available to the operator" in ev.data["output"]:
+                refused = True
+    finally:
+        await executor.close()
+
+    assert status_brain == "operator"     # the turn was handled by the operator
+    assert refused is True                # its forget attempt was refused by authority
+    assert approvals_asked == 0           # the user was never even asked
+    assert memory.recall("hunter2")       # the memory is intact
+    assert "authority_denied" in [s["kind"] for s in traces.turn(turn_id)]
 
 
 async def test_ingest_tool_reads_a_file_and_requires_approval(env, tmp_path: Path) -> None:

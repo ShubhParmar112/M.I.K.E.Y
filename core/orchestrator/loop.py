@@ -188,6 +188,30 @@ class Orchestrator:
                      "served_by": self._gateway.last_provider},
                 )
 
+                # Narrow authority, enforced not merely offered: a tool outside this
+                # brain's allowlist is refused here (e.g. the operator can never fire
+                # memory_forget — only the memory brain holds it). This backstops the
+                # gateway only sending the brain's tools, against a model that invents
+                # a call anyway.
+                if tc.name not in brain.tool_names:
+                    result_text = (
+                        f"'{tc.name}' is not available to the {brain.name} brain. "
+                        "Do not call it; continue without that tool."
+                    )
+                    self._traces.span(
+                        turn_id,
+                        "authority_denied",
+                        {"tool": tc.name, "brain": brain.name},
+                        parent_id=root,
+                    )
+                    yield StreamEvent(
+                        "action_result", {"tool": tc.name, "ok": False, "output": result_text}
+                    )
+                    messages.append(
+                        ChatMessage(role="tool_result", text=result_text, tool_call_id=tc.id)
+                    )
+                    continue
+
                 # The user's denial is enforced by the system, not by the model's
                 # obedience: an identical re-proposal never reaches the user again.
                 sig = json.dumps(
