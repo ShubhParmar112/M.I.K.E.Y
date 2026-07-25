@@ -22,12 +22,19 @@ class OllamaAdapter:
         transport: httpx.AsyncBaseTransport | None = None,
         keep_alive: str = "30m",
         num_predict: int = 512,
+        temperature: float = 0.3,
+        repeat_penalty: float = 1.15,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._transport = transport  # injectable for tests
         self._keep_alive = keep_alive  # keep the model resident: no ~77s cold reloads
         self._num_predict = num_predict  # cap the reply so a local turn stays snappy
+        self._temperature = temperature
+        # A small local model loops far more readily than the cloud one, and here we
+        # can ask the runtime to prevent it outright rather than detect it after the
+        # fact. >1.0 makes repeating a recent token progressively costlier.
+        self._repeat_penalty = repeat_penalty
 
     async def complete(
         self,
@@ -55,7 +62,11 @@ class OllamaAdapter:
             "messages": wire,
             "stream": False,
             "keep_alive": self._keep_alive,
-            "options": {"num_predict": self._num_predict},
+            "options": {
+                "num_predict": self._num_predict,
+                "temperature": self._temperature,
+                "repeat_penalty": self._repeat_penalty,
+            },
         }
         if tools:
             body["tools"] = [

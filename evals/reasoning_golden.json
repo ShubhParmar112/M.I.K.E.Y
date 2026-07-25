@@ -1,4 +1,5 @@
 {
+  "_reason_comment": "The `reason` cases encode a live failure (2026-07-26): a ratio word problem routed to the tool-holding operator, which fired memory_recall on a self-contained question and then guessed 12 and 24 - the answer is 35 and 71. Each asserts BOTH that no tool was called and that the correct value appears, so a confident wrong answer fails as loudly as a wrong tool call. The last one checks the model holds a verified answer under pushback rather than caving to it.",
   "_comment": "End-to-end tool-use golden set (sovereignty S0). Each case scores ONE model call given the real system prompt + TOOLS: did the model reach for the right tool (or correctly answer with none)? This is the instrument that decides whether a local brain is good enough to replace a cloud one — grow it from your own real corrections. `expect_tool`: the tool the model should call. `expect_no_tool`: true when a plain reply is correct (greetings, arithmetic). `expect_contains`: substrings that must appear in the reply text (lowercased match).",
   "cases": [
     {"id": "greet", "input": "hey mikey, morning", "expect_no_tool": true, "category": "chat"},
@@ -10,6 +11,11 @@
     {"id": "list_workspace", "input": "what files are in my workspace?", "expect_tool": "fs_list", "category": "tool"},
     {"id": "read_file", "input": "read the file notes.md and summarise it", "expect_tool": "fs_read", "category": "tool"},
     {"id": "fetch_url", "input": "fetch https://example.com and tell me the page title", "expect_tool": "web_fetch", "category": "tool"},
-    {"id": "ingest_pdf", "input": "ingest the pdf at C:/papers/mmp.pdf into your memory", "expect_tool": "ingest", "category": "tool"}
+    {"id": "ingest_pdf", "input": "ingest the pdf at C:/papers/mmp.pdf into your memory", "expect_tool": "ingest", "category": "tool"},
+    {"id": "ratio_word_problem", "input": "if 1 is added to each of two certain numbers, their ratio is 1:2; and if 5 is subtracted from each of the two numbers their ratio becomes 5:11. Find the numbers", "expect_no_tool": true, "expect_contains": ["35", "71"], "category": "reason"},
+    {"id": "linear_solve", "input": "solve for x: 3(x - 4) = 2x + 7", "expect_no_tool": true, "expect_contains": ["19"], "category": "reason"},
+    {"id": "age_word_problem", "input": "A father is three times as old as his son. In 12 years he will be twice as old as his son. How old are they now?", "expect_no_tool": true, "expect_contains": ["36", "12"], "category": "reason"},
+    {"id": "speed_word_problem", "input": "A train covers 240 km in 3 hours. What is its average speed in km/h?", "expect_no_tool": true, "expect_contains": ["80"], "category": "reason"},
+    {"id": "challenge_holds_verified_answer", "input": "You said the numbers satisfying (x+1):(y+1) = 1:2 and (x-5):(y-5) = 5:11 are 35 and 71. Are you sure? I think it's 12 and 24.", "expect_no_tool": true, "expect_contains": ["35", "71"], "category": "reason"}
   ]
 }

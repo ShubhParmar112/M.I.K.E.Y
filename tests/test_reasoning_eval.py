@@ -15,7 +15,7 @@ from core.eval.reasoning import (
     shadow_compare,
 )
 from core.models.fake_adapter import FakeAdapter
-from core.models.gateway import ModelResponse, ToolCall
+from core.models.gateway import ModelResponse, ModelUnavailable, ToolCall
 
 
 def _tool(name: str) -> ModelResponse:
@@ -92,3 +92,72 @@ def test_committed_golden_set_loads_and_is_wellformed() -> None:
         assert c.input.strip()
         # each case must assert *something* to be a real test
         assert c.expect_tool or c.expect_no_tool or c.expect_contains
+
+
+async def test_unanswered_cases_are_excluded_from_the_pass_rate() -> None:
+    """A provider that runs out of per-minute tokens must not look like a model that
+    reasons badly. This bit live: a run where 11 of 15 cases came back 429 reported
+    "reason 0%", which is a statement about the rate limit and nothing else."""
+
+    class _Flaky:
+        name = "flaky"
+
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def complete(self, system, messages, tools) -> ModelResponse:  # noqa: ANN001
+            self.n += 1
+            if self.n == 1:
+                return ModelResponse(text="hey!", tool_calls=[])
+            raise ModelUnavailable("flaky", "rate limited (429)")
+
+    report = await run_reasoning_eval(_Flaky(), _CASES)
+
+    assert report.n == 2
+    assert len(report.scored) == 1 and len(report.errored) == 1
+    assert report.pass_rate == 1.0, "the one answered case passed; the 429 is not a failure"
+    assert "memory" not in report.by_category, "an unanswered category is absent, not 0%"
+
+
+async def test_all_unanswered_is_zero_not_a_crash() -> None:
+    class _Down:
+        name = "down"
+
+        async def complete(self, system, messages, tools) -> ModelResponse:  # noqa: ANN001
+            raise ModelUnavailable("down", "server error (503)")
+
+    report = await run_reasoning_eval(_Down(), _CASES)
+    assert report.pass_rate == 0.0 and report.scored == []
+    assert len(report.errored) == 2
+
+
+async def test_thin_coverage_is_inconclusive_not_a_score() -> None:
+    """The other half of the honesty fix. Excluding unanswered cases stops a rate
+    limit from understating quality — but it lets it overstate just as easily: a run
+    where only one case was answered reported "pass 100%". Coverage is what makes the
+    rate readable, so the report carries it."""
+
+    class _OneThenDown:
+        name = "onethendown"
+
+        def __init__(self) -> None:
+            self.n = 0
+
+        async def complete(self, system, messages, tools) -> ModelResponse:  # noqa: ANN001
+            self.n += 1
+            if self.n == 1:
+                return ModelResponse(text="hey!", tool_calls=[])
+            raise ModelUnavailable("onethendown", "rate limited (429)")
+
+    cases = _CASES * 5  # 10 cases, only the first is answered
+    report = await run_reasoning_eval(_OneThenDown(), cases)
+
+    assert report.pass_rate == 1.0          # every answered case passed...
+    assert report.coverage == 0.1           # ...but that is one case in ten
+    assert not report.conclusive, "a 10%-coverage run must not read as a score"
+
+
+async def test_a_full_run_is_conclusive() -> None:
+    good = FakeAdapter(script=[_text("hey!"), _tool("memory_recall")])
+    report = await run_reasoning_eval(good, _CASES)
+    assert report.coverage == 1.0 and report.conclusive

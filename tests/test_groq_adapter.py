@@ -8,8 +8,9 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
-from core.models.gateway import ChatMessage, ToolCall
+from core.models.gateway import ChatMessage, ModelUnavailable, ToolCall
 from core.models.groq_adapter import GroqAdapter
 
 TOOLS = [
@@ -199,3 +200,229 @@ async def test_persistent_tool_use_failure_raises_with_detail() -> None:
         assert "tool_use_failed" in str(exc)
         assert "fs_read" in str(exc)  # failed_generation surfaced for debugging
     assert len(requests) == 3
+
+
+# --- repetition-collapse re-sample -------------------------------------------
+
+
+def _sequence(bodies: list[dict[str, Any]], contents: list[str]) -> httpx.MockTransport:
+    """Return `contents[i]` for the i-th request, recording each request body."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        text = contents[min(len(bodies) - 1, len(contents) - 1)]
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": text}}], "usage": {}}
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def _reply(bodies: list[dict[str, Any]], content: str) -> httpx.MockTransport:
+    return _sequence(bodies, [content])
+
+
+COLLAPSED = (
+    "After reevaluating the problem, I think the correct solution is indeed 7 and 14 is not "
+    "correct, but 12 and 24 is also not correct, the correct answer is actually 7 is not correct "
+    "but 12 is not correct, the correct answer is 7 is not the answer but one of the answer is 12 "
+    "is not correct but 7 is not the answer the correct answer is actually 12 is not correct but "
+    "one of the answer is 7 is not correct but the correct answer is actually 35 and 71 and 7 and "
+    "14 is not the answer, 12 and 24 is not the answer but 7 and 14 is not correct."
+)
+CLEAN = "Both conditions check out: 36:72 = 1:2 and 30:66 = 5:11, so the numbers are 35 and 71."
+
+
+async def test_request_is_capped_and_uses_configured_temperature() -> None:
+    """An unbounded reply is what let the live repetition loop run for a full
+    paragraph; every request now carries a ceiling."""
+    bodies: list[dict[str, Any]] = []
+    adapter = GroqAdapter(
+        "llama-3.3-70b-versatile",
+        api_key="k",
+        transport=_reply(bodies, "hi"),
+        temperature=0.35,
+        max_output_tokens=900,
+    )
+    await adapter.complete("sys", [ChatMessage(role="user", text="hey")], [])
+
+    assert bodies[0]["max_tokens"] == 900
+    assert bodies[0]["temperature"] == 0.35
+    # Penalties must NOT ride on a normal request: they also penalize the repeated
+    # punctuation of well-formed JSON tool arguments.
+    assert "frequency_penalty" not in bodies[0]
+
+
+async def test_a_collapsed_reply_is_resampled_and_replaced() -> None:
+    bodies: list[dict[str, Any]] = []
+    adapter = GroqAdapter(
+        "llama-3.3-70b-versatile",
+        api_key="k",
+        transport=_sequence(bodies, [COLLAPSED, CLEAN]),
+    )
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="solve it")], TOOLS)
+
+    assert resp.text == CLEAN
+    assert len(bodies) == 2, "the collapsed generation should have been re-sampled once"
+    # The re-sample leans the other way on purpose: low temperature is what sharpens
+    # a repetition loop in the first place.
+    assert bodies[1]["temperature"] > bodies[0]["temperature"]
+    assert bodies[1]["frequency_penalty"] > 0
+    assert bodies[1]["tool_choice"] == "none"  # we already know this turn ends in prose
+    assert any("re-sampled" in n for n in resp.notes), "the recovery must be traceable"
+
+
+async def test_a_healthy_reply_is_never_resampled() -> None:
+    """One model call for a good answer — the guard must not double every turn's cost."""
+    bodies: list[dict[str, Any]] = []
+    adapter = GroqAdapter("m", api_key="k", transport=_reply(bodies, CLEAN))
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="solve it")], [])
+
+    assert len(bodies) == 1
+    assert resp.text == CLEAN
+    assert resp.notes == []
+
+
+async def test_a_collapsed_resample_keeps_whichever_is_better() -> None:
+    """A re-sample can collapse too; the adapter keeps the less repetitive of the two
+    rather than trusting the second call blindly."""
+    bodies: list[dict[str, Any]] = []
+    worse = "no it is not 7 and 14. " * 12
+    adapter = GroqAdapter("m", api_key="k", transport=_sequence(bodies, [COLLAPSED, worse]))
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="solve it")], [])
+
+    assert len(bodies) == 2
+    assert resp.text == COLLAPSED, "kept the original: the re-sample looped harder"
+
+
+async def test_a_tool_call_is_never_resampled() -> None:
+    """Tool calls are structured output judged by the API, not prose to score."""
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": COLLAPSED,  # rambling text alongside the call
+                            "tool_calls": [
+                                {
+                                    "id": "c1",
+                                    "function": {
+                                        "name": "fs_read",
+                                        "arguments": '{"path": "notes.md"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {},
+            },
+        )
+
+    adapter = GroqAdapter("m", api_key="k", transport=httpx.MockTransport(handler))
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="read it")], TOOLS)
+
+    assert len(bodies) == 1
+    assert [tc.name for tc in resp.tool_calls] == ["fs_read"]
+
+
+async def test_an_unavailable_resample_degrades_to_the_original() -> None:
+    """A repetitive answer still beats failing the turn outright."""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": COLLAPSED}}], "usage": {}}
+            )
+        return httpx.Response(429, headers={"retry-after": "30"})
+
+    adapter = GroqAdapter(
+        "m", api_key="k", transport=httpx.MockTransport(handler), rate_limit_retries=0
+    )
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="solve it")], [])
+
+    assert resp.text == COLLAPSED
+    assert any("re-sample unavailable" in n for n in resp.notes)
+
+
+ANSWER_THEN_RESTART = (
+    "Let the two numbers be x and y. From (x + 1) : (y + 1) = 1 : 2 we get y = 2x + 1, and from "
+    "(x - 5) : (y - 5) = 5 : 11 we get 11x - 5y = 30. Substituting gives x = 35 and y = 71.\n"
+    "VERIFICATION: 36 : 72 = 1 : 2 and 30 : 66 = 5 : 11. Both conditions hold.\n"
+    "The final answer is: the two numbers are 35 and 71.\n"
+    "However we should also check another pair of numbers, let's try to solve the system again.\n"
+    "Let's try x = 12 and y = 24: (12 + 1) / (24 + 1) = 13 / 25, which is not 1 / 2.\n"
+    "But what about x = 6 and y = 12: (6 + 1) / (12 + 1) = 7 / 13, which is not 1 / 2."
+)
+
+
+async def test_a_restart_after_the_answer_is_trimmed_without_a_second_call() -> None:
+    """The reply already contains a correct, verified answer — it just didn't stop.
+    Cutting the tail is the fix; re-sampling it is not (live, that produced a second
+    runaway), so this must cost only the one call."""
+    bodies: list[dict[str, Any]] = []
+    adapter = GroqAdapter("m", api_key="k", transport=_reply(bodies, ANSWER_THEN_RESTART))
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="solve it")], [])
+
+    assert len(bodies) == 1, "trimming must not trigger a re-sample"
+    assert resp.text.endswith("the two numbers are 35 and 71.")
+    assert "12 and 24" not in resp.text
+    assert any("trimmed a restart" in n for n in resp.notes)
+
+
+async def test_a_healthy_reply_is_not_trimmed() -> None:
+    bodies: list[dict[str, Any]] = []
+    adapter = GroqAdapter("m", api_key="k", transport=_reply(bodies, CLEAN))
+    resp = await adapter.complete("sys", [ChatMessage(role="user", text="solve it")], [])
+
+    assert resp.text == CLEAN
+    assert resp.notes == []
+
+
+TPD_EXHAUSTED = {
+    "error": {
+        "message": (
+            "Rate limit reached for model `llama-3.3-70b-versatile` in organization "
+            "`org_abc` service tier `on_demand` on tokens per day (TPD): Limit 100000, "
+            "Used 96999, Requested 4294. Please try again in 18m37.152s. Need more "
+            "tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing"
+        ),
+        "type": "tokens",
+        "code": "rate_limit_exceeded",
+    }
+}
+
+
+async def test_a_429_carries_which_limit_was_hit() -> None:
+    """A per-minute spike clears in seconds; a per-day cap means the key is done until
+    the window rolls over. Collapsing both to "rate limited (429)" hides the one fact
+    that decides what to do next — it sent this session chasing a pacing fix for a
+    daily-quota exhaustion."""
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(429, json=TPD_EXHAUSTED, headers={"retry-after": "1118"})
+    )
+    adapter = GroqAdapter("m", api_key="k", transport=transport, rate_limit_retries=0)
+
+    with pytest.raises(ModelUnavailable) as exc:
+        await adapter.complete("sys", [ChatMessage(role="user", text="hi")], [])
+
+    assert "tokens per day (TPD)" in exc.value.reason
+    assert "Limit 100000, Used 96999" in exc.value.reason
+    assert exc.value.retry_after == 1118.0
+    assert "Upgrade to Dev Tier" not in exc.value.reason, "the upsell is not diagnosis"
+
+
+async def test_a_429_without_a_body_still_reports_cleanly() -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(429, text="nope"))
+    adapter = GroqAdapter("m", api_key="k", transport=transport, rate_limit_retries=0)
+
+    with pytest.raises(ModelUnavailable) as exc:
+        await adapter.complete("sys", [ChatMessage(role="user", text="hi")], [])
+    assert exc.value.reason == "rate limited (429)"

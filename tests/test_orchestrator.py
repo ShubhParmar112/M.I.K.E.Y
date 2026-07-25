@@ -4,20 +4,21 @@ written. This is the Gen 1 spine under test."""
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from core.config import Config
-from core.events.schema import Event, EventType, Provenance, Tier, ulid
+from core.events.schema import Event, EventType, Provenance, Tier, now, ulid
 from core.events.store import EventStore
 from core.executor_client import ExecutorClient
 from core.memory.store import MemoryStore
 from core.models.fake_adapter import FakeAdapter
 from core.models.gateway import ModelGateway, ModelResponse, ToolCall
 from core.orchestrator.critic import Critic
-from core.orchestrator.loop import ApprovalRegistry, Orchestrator
+from core.orchestrator.loop import BRAIN_HINT_TTL, ApprovalRegistry, Orchestrator
 from core.policy.engine import PolicyEngine
 from core.storage.db import Database
 from core.trace.store import TraceStore
@@ -639,3 +640,144 @@ async def test_plain_answer_no_tools(env) -> None:
     finally:
         await executor.close()
     assert finals == ["2 + 2 = 4"]
+
+
+LIVE_PROBLEM = (
+    "if 1 is added to each of two certain numbers, their ratio is 1:2; and if 5 is "
+    "subtracted from each of the two numbers their ratio becomes 5:11. Find the numbers"
+)
+
+
+async def test_closed_problem_uses_the_toolless_reasoning_brain(env) -> None:
+    """The live failure (2026-07-26): this exact problem reached the full operator,
+    which answered it by firing memory_recall and then guessing 12 and 24. It belongs
+    on a brain that holds no tools, so a lookup cannot stand in for the algebra."""
+    config, db = env
+    answer = "Both conditions check out (36:72 = 1:2, 30:66 = 5:11), so the numbers are 35 and 71."
+    fake = FakeAdapter([ModelResponse(text=answer, tool_calls=[])])
+    memory = MemoryStore(db, EventStore(db))
+    traces = TraceStore(db)
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(
+        config, memory, traces, PolicyEngine(db), ModelGateway(fake), executor,
+        ApprovalRegistry(),
+    )
+
+    brain = ""
+    finals: list[str] = []
+    try:
+        async for ev in orch.run_turn("s1", LIVE_PROBLEM):
+            if ev.kind == "status":
+                brain = ev.data["brain"]
+            if ev.kind == "final":
+                finals.append(ev.data["text"])
+    finally:
+        await executor.close()
+
+    assert brain == "reasoning"
+    assert finals == [answer]
+    # the reasoning brain's own derive-then-verify prompt was used...
+    assert "VERIFY" in fake.systems[0]
+    # ...and it was offered NO tools, so memory_recall was never even on the table
+    assert fake.tools == [[]]
+    assert EventType.ACTION_EXECUTED.value not in [e.type for e in memory.events.recent()]
+
+
+async def test_a_follow_up_stays_on_the_reasoning_brain(env) -> None:
+    """"are you sure about that?" carries none of the problem's vocabulary, so
+    stateless routing sent it to a different brain mid-derivation. The orchestrator
+    passes the previous turn's brain so the two turns stay together."""
+    config, db = env
+    fake = FakeAdapter([
+        ModelResponse(text="The numbers are 35 and 71 (36:72 = 1:2, 30:66 = 5:11).", tool_calls=[]),
+        ModelResponse(text="It stands: 36:72 = 1:2 and 30:66 = 5:11. 12 and 24 fails both.",
+                      tool_calls=[]),
+    ])
+    memory = MemoryStore(db, EventStore(db))
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(
+        config, memory, TraceStore(db), PolicyEngine(db), ModelGateway(fake), executor,
+        ApprovalRegistry(),
+    )
+
+    brains: list[str] = []
+    try:
+        for text in (LIVE_PROBLEM, "are you sure about that, and what about 12 and 24?"):
+            async for ev in orch.run_turn("s1", text):
+                if ev.kind == "status":
+                    brains.append(ev.data["brain"])
+    finally:
+        await executor.close()
+
+    assert brains == ["reasoning", "reasoning"]
+
+
+async def test_the_brain_hint_is_scoped_to_the_session(env) -> None:
+    """Stickiness must not leak between sessions: a fresh session's first turn is
+    routed on its own text alone."""
+    config, db = env
+    fake = FakeAdapter([
+        ModelResponse(text="The numbers are 35 and 71.", tool_calls=[]),
+        ModelResponse(text="Hey — what's up?", tool_calls=[]),
+    ])
+    memory = MemoryStore(db, EventStore(db))
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(
+        config, memory, TraceStore(db), PolicyEngine(db), ModelGateway(fake), executor,
+        ApprovalRegistry(),
+    )
+
+    brains: list[str] = []
+    try:
+        async for ev in orch.run_turn("s1", LIVE_PROBLEM):
+            if ev.kind == "status":
+                brains.append(ev.data["brain"])
+        async for ev in orch.run_turn("s2", "hey mikey"):  # different session
+            if ev.kind == "status":
+                brains.append(ev.data["brain"])
+    finally:
+        await executor.close()
+
+    assert brains == ["reasoning", "conversation"]
+
+
+async def test_a_stale_brain_hint_is_ignored(env) -> None:
+    """The CLI reuses the session id `default` across runs, so without a recency bound
+    yesterday's last turn would steer today's first one — and "hey mikey" the next
+    morning would be handled by the reasoning brain."""
+    config, db = env
+    events = EventStore(db)
+    memory = MemoryStore(db, events)
+    # A reasoning turn from well outside the hint's TTL.
+    events.append(
+        Event(
+            type=EventType.ASSISTANT_MESSAGE.value,
+            ts=now() - BRAIN_HINT_TTL - timedelta(minutes=5),
+            payload={"text": "The numbers are 35 and 71.", "session_id": "default",
+                     "turn_id": "t0", "brain": "reasoning"},
+        )
+    )
+    fake = FakeAdapter([
+        ModelResponse(text="Hey — what's on today?", tool_calls=[]),
+        ModelResponse(text="Happy to dig in — what would you like to know?", tool_calls=[]),
+    ])
+    executor = ExecutorClient(config.workspace)
+    orch = Orchestrator(
+        config, memory, TraceStore(db), PolicyEngine(db), ModelGateway(fake), executor,
+        ApprovalRegistry(),
+    )
+
+    brains: list[str] = []
+    try:
+        # A greeting, and a turn shaped exactly like a problem follow-up. Both must be
+        # routed on their own text, as if the stale reasoning turn were not there.
+        for text in ("hey mikey", "why?"):
+            async for ev in orch.run_turn("default", text):
+                if ev.kind == "status":
+                    brains.append(ev.data["brain"])
+    finally:
+        await executor.close()
+
+    assert brains == ["conversation", "operator"], (
+        "a day-old reasoning turn must not steer a new sitting"
+    )

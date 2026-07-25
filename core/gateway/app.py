@@ -41,11 +41,20 @@ def _make_adapter(config: Config, provider: str | None = None) -> ModelAdapter:
     if provider == "groq":
         from core.models.groq_adapter import GroqAdapter
 
-        return GroqAdapter(config.groq_model)
+        return GroqAdapter(
+            config.groq_model,
+            temperature=config.temperature,
+            max_output_tokens=config.max_output_tokens,
+        )
     if provider == "ollama":
         from core.models.ollama_adapter import OllamaAdapter
 
-        return OllamaAdapter(config.ollama_base_url, config.ollama_model)
+        return OllamaAdapter(
+            config.ollama_base_url,
+            config.ollama_model,
+            temperature=config.temperature,
+            num_predict=config.max_output_tokens,
+        )
     return FakeAdapter()
 
 
@@ -62,11 +71,24 @@ def _make_fallbacks(config: Config) -> list[ModelAdapter]:
     if config.provider != "groq" and os.environ.get("GROQ_API_KEY"):
         from core.models.groq_adapter import GroqAdapter
 
-        chain.append(GroqAdapter(config.groq_model))
+        chain.append(
+            GroqAdapter(
+                config.groq_model,
+                temperature=config.temperature,
+                max_output_tokens=config.max_output_tokens,
+            )
+        )
     if config.local_fallback and config.provider in ("groq", "anthropic"):
         from core.models.ollama_adapter import OllamaAdapter
 
-        chain.append(OllamaAdapter(config.ollama_base_url, config.fallback_ollama_model))
+        chain.append(
+            OllamaAdapter(
+                config.ollama_base_url,
+                config.fallback_ollama_model,
+                temperature=config.temperature,
+                num_predict=config.max_output_tokens,
+            )
+        )
     return chain
 
 
@@ -80,7 +102,12 @@ def _make_routes(config: Config) -> dict[str, ModelAdapter]:
     from core.models.ollama_adapter import OllamaAdapter
     from core.orchestrator.brains import BRAINS
 
-    local = OllamaAdapter(config.ollama_base_url, config.ollama_model)
+    local = OllamaAdapter(
+        config.ollama_base_url,
+        config.ollama_model,
+        temperature=config.temperature,
+        num_predict=config.max_output_tokens,
+    )
     routes: dict[str, ModelAdapter] = {}
     for name in config.local_brains:
         brain = BRAINS.get(name)

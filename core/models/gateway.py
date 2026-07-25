@@ -35,6 +35,10 @@ class ModelResponse:
     text: str
     tool_calls: list[ToolCall]
     usage: dict[str, int] = field(default_factory=dict)
+    # Adapter-level notes about how this response was produced — e.g. that a
+    # collapsed generation was re-sampled. Recorded in the turn's trace so a
+    # degraded reply is visible after the fact instead of silently smoothed over.
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

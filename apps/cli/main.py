@@ -475,6 +475,12 @@ def reasoning_eval_cmd(
     against: str = typer.Option(
         None, help="provider to shadow-compare against, e.g. ollama (cloud vs local)"
     ),
+    pace: float = typer.Option(
+        20.0,
+        help="seconds between cases; keeps a free-tier key under its per-minute token "
+        "limit (Groq free tier is 12k TPM and a case costs ~2.4k input + up to "
+        "max_tokens reserved — about 3 cases/min, so the golden set takes ~5 min)",
+    ),
 ) -> None:
     """Score tool-use reasoning on the golden set; optionally shadow-compare a
     second provider (sovereignty S0). Promotes nothing — it only measures."""
@@ -490,7 +496,9 @@ def reasoning_eval_cmd(
         return " · ".join(f"{c} {r:.0%}" for c, r in sorted(report.by_category.items()))
 
     if against:
-        rep = asyncio.run(shadow_compare(primary, _make_adapter(CONFIG, against), cases))
+        rep = asyncio.run(
+            shadow_compare(primary, _make_adapter(CONFIG, against), cases, pace_s=pace)
+        )
         inc, cand = rep.incumbent, rep.candidate
         console.print(
             Panel(
@@ -522,14 +530,42 @@ def reasoning_eval_cmd(
         console.print(table)
         return
 
-    rep_one = asyncio.run(run_reasoning_eval(primary, cases))
+    rep_one = asyncio.run(run_reasoning_eval(primary, cases, pace_s=pace))
+    scored, errored = rep_one.scored, rep_one.errored
+    passed = sum(r.passed for r in scored)
+    # A rate limit must not be able to fake a score in EITHER direction. Excluding
+    # unanswered cases from the rate stops it understating quality; refusing to
+    # headline a rate with thin coverage stops it overstating — 14 of 15 cases
+    # rate-limited once printed "pass 100%" off a single answered case.
+    if not rep_one.conclusive:
+        summary = (
+            f"[bold yellow]INCONCLUSIVE[/bold yellow] — the provider answered only "
+            f"{len(scored)}/{rep_one.n} cases; the rest came back rate-limited or "
+            f"unavailable, so this run does not measure quality.\n"
+            f"adapter [bold]{rep_one.adapter}[/bold] · of those answered, "
+            f"{passed} passed\n"
+            f"[dim]Check the reason column: a per-minute (TPM) limit is fixed by a "
+            f"larger --pace; a per-day (TPD) limit means the key is spent until the "
+            f"window rolls over, and no pacing will help.[/dim]"
+        )
+    else:
+        summary = (
+            f"pass [bold]{rep_one.pass_rate:.0%}[/bold] "
+            f"({passed}/{len(scored)} answered) · "
+            f"adapter [bold]{rep_one.adapter}[/bold]\n{_cats(rep_one)}"
+        )
+        if errored:
+            summary += (
+                f"\n[yellow]{len(errored)} case(s) unanswered by the provider "
+                f"(rate limit / outage) — excluded from the rate.[/yellow]"
+            )
     console.print(
         Panel(
-            f"pass [bold]{rep_one.pass_rate:.0%}[/bold] "
-            f"({sum(r.passed for r in rep_one.results)}/{rep_one.n}) · "
-            f"adapter [bold]{rep_one.adapter}[/bold]\n{_cats(rep_one)}",
+            summary,
             title="reasoning eval",
-            border_style="green" if rep_one.pass_rate >= 0.8 else "yellow",
+            border_style=(
+                "green" if rep_one.conclusive and rep_one.pass_rate >= 0.8 else "yellow"
+            ),
         )
     )
     table = Table(show_header=True, header_style="bold")
@@ -538,7 +574,10 @@ def reasoning_eval_cmd(
     table.add_column("tools called")
     table.add_column("detail")
     for r in rep_one.results:
-        mark = "[green]ok[/green]" if r.passed else "[red]XX[/red]"
+        if r.error:
+            mark = "[yellow]--[/yellow]"  # unanswered, not wrong
+        else:
+            mark = "[green]ok[/green]" if r.passed else "[red]XX[/red]"
         detail = r.error or r.detail
         table.add_row(f"{mark} {r.id}", r.category, ",".join(r.tools_called) or "-", detail[:60])
     console.print(table)

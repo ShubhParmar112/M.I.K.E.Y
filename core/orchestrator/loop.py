@@ -11,11 +11,12 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any, AsyncIterator
 
 from core.config import Config
 from core.context.assembly import ContextAssembler
-from core.events.schema import Event, EventType, Provenance, Tier, ulid
+from core.events.schema import Event, EventType, Provenance, Tier, now, ulid
 from core.executor_client import ExecResult, ExecutorClient
 from core.memory.provenance import annotate
 from core.memory.store import MemoryStore
@@ -27,6 +28,11 @@ from core.policy.engine import ActionRequest, Decision, PolicyEngine
 from core.trace.store import TraceStore
 
 MAX_STEPS = 12  # hard stop against runaway loops (review M8's tiny Gen 1 cousin)
+# How long the previous turn's brain still informs routing. Long enough to cover a
+# pause mid-conversation, short enough that a new sitting starts clean — the CLI
+# reuses the session id `default`, so this is what stops yesterday's last turn from
+# steering today's first one.
+BRAIN_HINT_TTL = timedelta(minutes=30)
 
 # These tools run in-process, not in the sandboxed executor: memory tools touch
 # M.I.K.E.Y's own state, and `ingest` reads a user-named file (possibly outside
@@ -93,7 +99,10 @@ class Orchestrator:
         # Route first (S1): pick which brain handles this turn. A social sign-off
         # goes to the toolless conversation brain — which structurally cannot fire
         # memory_forget — while anything actionable goes to the full operator.
-        routing = self._router.route(user_input)
+        # The previous turn's brain keeps a multi-turn piece of work (a problem and
+        # the "are you sure?" that follows it) on one brain instead of switching
+        # mid-derivation.
+        routing = self._router.route(user_input, last_brain=self._last_brain(session_id))
         brain = routing.brain
         # Classify privacy tier (S3): a plainly-private turn is Tier-0 — forced
         # on-device by the gateway and excluded from cloud training. The tier tags
@@ -170,6 +179,10 @@ class Orchestrator:
                     "text": resp.text[:2000],
                     "tool_calls": [{"name": t.name, "args": t.arguments} for t in resp.tool_calls],
                     "usage": resp.usage,
+                    # e.g. "re-sampled after repetition collapse" — a degraded
+                    # generation stays visible in the trace instead of being smoothed
+                    # over silently by the adapter that recovered from it.
+                    "notes": resp.notes,
                 },
                 parent_id=root,
             )
@@ -388,6 +401,26 @@ class Orchestrator:
             "error",
             {"message": f"turn exceeded {MAX_STEPS} steps and was stopped (runaway guard)"},
         )
+
+    def _last_brain(self, session_id: str) -> str | None:
+        """Which brain handled the most recent turn of this session, if any.
+
+        Read from the event log rather than kept in memory, so it survives a gateway
+        restart the same way the conversation history does. Ignored once stale: the
+        CLI reuses the session id `default` across runs, so without a recency bound
+        yesterday's last turn would still be steering today's first one.
+        """
+        recent = self._memory.events.recent(
+            types=[EventType.ASSISTANT_MESSAGE.value], limit=20
+        )
+        for ev in reversed(recent):  # newest first
+            if ev.payload.get("session_id") != session_id:
+                continue
+            if now() - ev.ts > BRAIN_HINT_TTL:
+                return None
+            brain = ev.payload.get("brain")
+            return str(brain) if brain else None
+        return None
 
     def _call_inprocess_tool(
         self, name: str, args: dict[str, Any], tainted: bool, turn_id: str,

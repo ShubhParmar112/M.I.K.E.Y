@@ -24,7 +24,7 @@ This repository contains a working **Gen 1–3 core** — append-only event log,
 
 ```powershell
 uv sync                      # install
-uv run pytest                # verify (136 passing)
+uv run pytest                # verify (231 passing)
 
 # pick a model provider (any of the three):
 $env:GROQ_API_KEY = "gsk_..."               # cloud (Groq, free tier, Llama 3.3), or:
@@ -76,7 +76,7 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 | Command | What it does |
 |---|---|
 | `mikey doctor` | Setup check: cloud providers, local model host, which brain runs where (+ localization advice), audit-chain integrity. |
-| `mikey reasoning-eval [--against <provider>]` | Score tool-use on the golden set; `--against ollama` shadow-compares cloud vs local (the gate before localizing a reasoning brain). |
+| `mikey reasoning-eval [--against <provider>] [--pace N]` | Score tool-use + reasoning on the golden set; `--against ollama` shadow-compares cloud vs local (the gate before localizing a reasoning brain). Cases the provider never answered (429 / outage) are excluded from the pass rate and reported separately, and a run with thin coverage is labelled **inconclusive** rather than scored — a rate limit must not be readable as a quality number in either direction. `--pace` (default 20s) keeps a free-tier key under its **per-minute** token budget (Groq free tier: 12k TPM, ~2.4k input per case, so ~3 cases/min — the full set takes ~5 min). A **per-day** cap (100k TPD) is a different thing entirely and pacing cannot help it; the 429's reason names which limit was hit. |
 | `mikey export [--out DIR] [--include-t0]` | Export the event log → per-brain training datasets (respects tombstones + privacy tiers). |
 | `mikey eval [--update-baseline]` | Retrieval-quality eval against the golden set. |
 
@@ -94,11 +94,16 @@ Every turn is routed to one of a small fleet of **brains** — each a capability
 | Brain | Role | Tools |
 |---|---|---|
 | `conversation` | greetings, sign-offs, small talk | none |
+| `reasoning` | closed problems — maths, logic, puzzles: derive, then verify | none |
 | `operator` | actionable turns, questions, recall/remember | all except `memory_forget` |
 | `memory` | forgetting / correcting stored memory | recall, remember, forget |
 | `critic` | reviews a risky action before you approve it | none (judges) |
 | `planner` | turns a goal into a durable mission | none (proposes) |
 | `router` | picks the brain per turn | heuristic (always local) |
+
+A self-contained problem goes to `reasoning`, which holds **no tools** — so a lookup can't stand in for the algebra — and is prompted to derive, substitute its answer back into the original conditions, and stop once the check passes. Routing is sticky across a problem: the "are you sure?" that follows stays on the same brain instead of switching mid-derivation.
+
+Model replies are also screened for the two ways an open-weight model runs away instead of answering: a **repetition collapse** (re-sampled once with anti-repetition settings) and a **restart after the answer** — "let's try another approach" followed by guessed values — which is trimmed. Both are recorded in the turn's trace, so a recovered reply is visible rather than silently smoothed over.
 
 Brains are served by a **cloud primary with a local (Ollama) fallback** — auto-routing to Ollama on rate-limit/offline. Any brain can also be pinned **on-device**, one at a time, so its calls never leave the machine:
 
@@ -107,7 +112,7 @@ $env:MIKEY_LOCAL_BRAINS = "conversation"   # serve chit-chat locally; keep reaso
 $env:MIKEY_OLLAMA_MODEL = "llama3.2"       # the local model used for pinned brains
 ```
 
-Useful env knobs: `MIKEY_LOCAL_BRAINS` (brains to run locally), `MIKEY_OLLAMA_MODEL` (local model), `MIKEY_LOCAL_FALLBACK=0` (disable the fallback), `MIKEY_PROVIDER` / `MIKEY_MODEL` (cloud choice), `MIKEY_HOME`, `MIKEY_WORKSPACE`. `mikey doctor` prints the effective result. See [docs/04-intelligence-sovereignty.md](docs/04-intelligence-sovereignty.md) for the full local-migration plan.
+Useful env knobs: `MIKEY_LOCAL_BRAINS` (brains to run locally), `MIKEY_OLLAMA_MODEL` (local model), `MIKEY_LOCAL_FALLBACK=0` (disable the fallback), `MIKEY_PROVIDER` / `MIKEY_MODEL` (cloud choice), `MIKEY_TEMPERATURE` (default `0.3` — very low values make open models loop), `MIKEY_MAX_OUTPUT_TOKENS` (default `1536`), `MIKEY_HOME`, `MIKEY_WORKSPACE`. `mikey doctor` prints the effective result. See [docs/04-intelligence-sovereignty.md](docs/04-intelligence-sovereignty.md) for the full local-migration plan.
 
 ## Status
 
@@ -118,7 +123,7 @@ Useful env knobs: `MIKEY_LOCAL_BRAINS` (brains to run locally), `MIKEY_OLLAMA_MO
 | Model gateway (Groq / Anthropic / Ollama / fake · tier + capability routing) | ✅ `core/models/` |
 | Policy engine + hash-chained audit + taint rule | ✅ `core/policy/` |
 | Executor sandbox (separate process, path confinement, command allowlist) | ✅ `executor/` |
-| Turn loop + brain fleet (router · conversation · operator · memory · critic · planner) | ✅ `core/orchestrator/` |
+| Turn loop + brain fleet (router · conversation · reasoning · operator · memory · critic · planner) | ✅ `core/orchestrator/` |
 | Durable missions (multi-step, policy-gated, resume after reboot) | ✅ `core/missions/` |
 | Memory: hybrid FTS + vector retrieval, ingestion, verified forgetting, taint | ✅ `core/memory/`, `core/ingest/` |
 | Session gateway API (SSE streaming, approvals, traces) | ✅ `core/gateway/` |

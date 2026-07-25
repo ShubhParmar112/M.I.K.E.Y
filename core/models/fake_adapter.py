@@ -15,6 +15,10 @@ class FakeAdapter:
         self._script = list(script or [])
         self.calls: list[list[ChatMessage]] = []
         self.systems: list[str] = []
+        # What each call was actually offered. A toolless brain's guarantee is that
+        # the model never *sees* the tool — asserting on this checks the offer, not
+        # just the absence of an action the model may simply have declined to take.
+        self.tools: list[list[dict[str, Any]]] = []
 
     async def complete(
         self,
@@ -24,6 +28,7 @@ class FakeAdapter:
     ) -> ModelResponse:
         self.calls.append(list(messages))
         self.systems.append(system)
+        self.tools.append(list(tools))
         if self._script:
             return self._script.pop(0)
         return ModelResponse(

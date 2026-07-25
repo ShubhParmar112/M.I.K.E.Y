@@ -61,6 +61,16 @@ class Config:
     tier_classify: bool = field(
         default_factory=lambda: os.environ.get("MIKEY_TIER_CLASSIFY", "1") != "0"
     )
+    # Sampling. Temperature stays low for a factual assistant, but NOT at 0.2 —
+    # open-weight models fall into repetition loops most readily at very low
+    # temperature, which is how a live turn produced a paragraph of self-negating
+    # text. The cap bounds any loop that still starts (and a real derivation fits).
+    temperature: float = field(
+        default_factory=lambda: float(os.environ.get("MIKEY_TEMPERATURE", "0.3"))
+    )
+    max_output_tokens: int = field(
+        default_factory=lambda: int(os.environ.get("MIKEY_MAX_OUTPUT_TOKENS", "1536"))
+    )
     # Semantic retrieval via a local embedding model (degrades to keyword-only if
     # the model/Ollama is unavailable). Set MIKEY_VECTORS=0 to disable entirely.
     local_vectors: bool = field(

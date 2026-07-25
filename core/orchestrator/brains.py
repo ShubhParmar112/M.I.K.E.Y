@@ -12,7 +12,7 @@ same Model Gateway. But the seam is now real — each brain has its own prompt,
 its own tools, its own logged I/O — so later phases can (a) replace one brain at
 a time with a local model and (b) train each from its own corpus.
 
-Slice 1 ships two brains and a conservative heuristic router:
+The router-selectable brains, and a conservative heuristic router:
 
 - **operator** — the full generalist (all tools). The safe default; unchanged
   behavior. Anything that might need a tool, memory, or an action lands here.
@@ -20,6 +20,10 @@ Slice 1 ships two brains and a conservative heuristic router:
   small talk. Because it holds no tools it *cannot* touch memory or the executor
   — which is precisely what would have prevented the live memory_forget cascade
   on a goodbye.
+- **reasoning** — closed problems (maths, logic, puzzles), *no tools*. Derives
+  and then verifies against the original statement. Also toolless by design: the
+  failure it fixes is the operator answering a self-contained ratio problem with
+  a `memory_recall` and a guess instead of algebra.
 
 The Router is a transparent heuristic here; it is the same seam a small trained
 router model slots into later (§7.5) — `route()` is the only thing that changes.
@@ -50,6 +54,51 @@ praise and fawning.
 If it turns out they actually want something done — a lookup, a file change, remembering or \
 forgetting a fact — tell them to say so directly and you'll take care of it. Do NOT pretend \
 you've already done it."""
+
+REASONING_PROMPT = """You are M.I.K.E.Y's reasoning brain. The person has given you a \
+self-contained problem — maths, logic, a puzzle, a units or dates calculation — and your job is to \
+get it RIGHT, not to answer fast. You hold no tools: everything you need is in the problem \
+statement, so do the work yourself rather than looking anything up.
+
+FIRST decide which situation you are in, and follow only that branch.
+
+(A) A NEW problem — one you have not already solved in this conversation. Work it in this order:
+1. Restate what is given and what is asked, in your own words. Name your unknowns explicitly \
+(e.g. "let the numbers be x and y").
+2. Translate each condition in the problem into one equation or constraint. Every condition in \
+the statement must appear — if you have used only some of them, you have mis-read the problem. \
+Translate carefully: "adding 1 to each gives a ratio of 1:2" means (x+1):(y+1) = 1:2, which is \
+y = 2x + 1, NOT y = 2x.
+3. Solve, showing the steps compactly. No skipped algebra, no arithmetic done in your head.
+4. VERIFY: substitute your result back into the ORIGINAL wording of each condition and show that \
+each one holds. This is what catches a wrong answer before the person sees it.
+5. State the final answer in one clear sentence.
+
+(B) A FOLLOW-UP about a problem you have ALREADY solved and verified above — "are you sure?", "so \
+what's the correct answer?", "what about X?", "show me the working". Do NOT solve it again from \
+scratch. Answer in three to six lines:
+- state the answer you already established;
+- show the substitution check in a line or two;
+- if they named a specific alternative, test THEIR value once and say whether it holds.
+A verified answer does not need re-deriving, and re-deriving it is exactly how a correct answer \
+gets thrown away. Being questioned is not evidence that you were wrong.
+
+WHEN YOUR ANSWER HAS BEEN CHECKED, YOU ARE DONE — STOP WRITING. Do not "try another approach", do \
+not go looking for another pair of values, do not solve the same system a second time, do not \
+re-verify what you just verified. One derivation, one check, one answer, then end the message.
+
+Two things you must never do:
+- Never hunt for the answer by trying candidate values one after another. Solve the equations. If \
+you catch yourself testing pair after pair to see which fits, stop: that means you made an algebra \
+error earlier, so go back and find it. Guess-and-check is not a derivation and will not become one \
+however many pairs you try.
+- Never write a chain of hedges like "X is not correct but Y is not correct either". If you notice \
+yourself contradicting something you wrote a moment ago, stop and state a single conclusion.
+
+If your verification fails, say so and go back to step 2 — do not present a result you could not \
+check. If their alternative verifies and yours does not, say plainly that you were wrong and give \
+the correct answer once. If a problem is genuinely ambiguous or underdetermined, say which reading \
+you took and why."""
 
 MEMORY_PROMPT = """You are M.I.K.E.Y's memory manager — the ONLY part of the system trusted to \
 change or delete long-term memory. The person has asked you to manage what M.I.K.E.Y remembers, \
@@ -143,6 +192,19 @@ CONVERSATION = Brain(
     tool_names=frozenset(),  # no tools: cannot touch memory or the executor
 )
 
+REASONING = Brain(
+    name="reasoning",
+    system_prompt=REASONING_PROMPT,
+    capability="reason",
+    tier=Tier.T1,
+    # No tools, for the same reason the conversation brain has none: the failure it
+    # fixes is a *tool call*. Handed the full toolset, the operator answered a
+    # self-contained ratio problem by firing memory_recall and then guessing. A
+    # closed problem needs derivation, and a brain with no tools cannot substitute
+    # a lookup for thinking.
+    tool_names=frozenset(),
+)
+
 MEMORY = Brain(
     name="memory",
     system_prompt=MEMORY_PROMPT,
@@ -172,7 +234,7 @@ PLANNER = Brain(
 )
 
 BRAINS: dict[str, Brain] = {
-    b.name: b for b in (OPERATOR, CONVERSATION, MEMORY, CRITIC, PLANNER)
+    b.name: b for b in (OPERATOR, CONVERSATION, REASONING, MEMORY, CRITIC, PLANNER)
 }
 
 
@@ -223,16 +285,123 @@ _SOCIAL = re.compile(
 )
 
 
+# A turn that plainly needs the world outside the message: a file, a command, the
+# network, or long-term memory. This is the guard on reasoning routing — it must
+# never strand "solve the equations in problem.txt" in a brain with no tools. Kept
+# to unambiguous markers, since over-matching here just costs the reasoning prompt.
+_NEEDS_TOOLS = re.compile(
+    r"\b("
+    r"file|folder|directory|path|workspace|repo|git|"
+    r"read|write|open|save|create|run|execute|command|script|"
+    r"fetch|download|url|https?|ingest|"
+    r"remember|forget|recall|memor(y|ies|ise|ize)|"
+    r"earlier|last time|previously"
+    r")\b"
+    r"|\.(py|md|txt|pdf|csv|json|ya?ml)\b"
+    # Any reference to something established in a past conversation is a memory
+    # need, however mathematical the rest of the sentence sounds — "what did I tell
+    # you the deadline ratio was?" is a lookup, not a derivation. Generous on
+    # purpose: over-matching here only sends the turn to the more capable brain.
+    r"|\b(i|we) (told|tell|said|say|mentioned|gave|asked)\b"
+    r"|\bdid i\b"
+    r"|\byou (said|told|know|knew|remember|mentioned|have)\b"
+    r"|\bwe (discussed|decided|talked|agreed|chose|picked)\b",
+    re.I,
+)
+
+# Math/logic vocabulary strong enough to identify a problem on its own.
+_MATH_STRONG = re.compile(
+    r"\b("
+    r"solve|prove|simplify|factori[sz]e|expand|evaluate|differentiate|integrate|"
+    r"equation|inequality|ratio|proportion|derivative|integral|logarithm|polynomial|"
+    r"probability|permutations?|combinations?|"
+    r"maths?|mathematical|algebra|geometry|trigonometry|calculus|arithmetic"
+    r")\b",
+    re.I,
+)
+
+# Weaker quantitative vocabulary — real problems mention these, but so does ordinary
+# chat ("what's the average wait time?"). Requires a number in the turn to count.
+_MATH_WEAK = re.compile(
+    r"\b("
+    r"sum|difference|product|quotient|remainder|divisible|multiple|factor|prime|"
+    r"digits?|numbers?|integers?|fraction|percent(age)?|average|mean|median|"
+    r"triangle|circle|square|rectangle|angle|radius|diameter|area|perimeter|"
+    r"volume|hypotenuse|speed|velocity|interest"
+    r")\b",
+    re.I,
+)
+
+# Word-problem framing: a stated setup followed by a question. "if ... find/then"
+# is the classic textbook shape and the one the live failure took.
+_WORD_PROBLEM = re.compile(
+    r"\bif\b[^.?!]{10,}?\b(find|then|what|how much|how many)\b"
+    r"|\bhow (many|much|old|far|long|fast|tall|deep)\b"
+    r"|\bwhat (is|are|was|were|will be) the (value|answer|result|numbers?|ratio|sum|"
+    r"total|probability|area|length|speed)\b",
+    re.I,
+)
+
+_HAS_NUMBER = re.compile(r"\d")
+
+# A follow-up that continues the previous turn's problem rather than starting
+# something new — a challenge, a request for the working, a proposed alternative.
+_FOLLOW_UP = re.compile(
+    r"\b("
+    r"(are|you) sure|really|is that right|correct|wrong|mistake|"
+    r"re-?check|double.?check|verify|check (it|that|again)|prove it|"
+    r"why|how did you|show (me )?(the |your )?(steps?|working|work)|explain|"
+    r"what about|and if|then what|but what|"
+    r"(the|final|right) answer"
+    r")\b",
+    re.I,
+)
+
+
+def _is_problem(text: str) -> bool:
+    """Does this turn state a closed problem to be worked out?"""
+    if _MATH_STRONG.search(text):
+        return True
+    has_number = bool(_HAS_NUMBER.search(text))
+    return has_number and bool(_MATH_WEAK.search(text) or _WORD_PROBLEM.search(text))
+
+
 class Router:
     """Chooses which brain handles a turn. Heuristic today; the seam a trained
     router model replaces later, behind this same `route()` interface."""
 
-    def route(self, user_input: str) -> Routing:
+    def route(self, user_input: str, last_brain: str | None = None) -> Routing:
+        """`last_brain` is the brain that handled the previous turn of this session.
+
+        Routing is otherwise stateless, which broke down live: a ratio problem and
+        the "are you sure about that?" that followed it are one piece of work, but
+        the follow-up carries none of the problem's own vocabulary and landed on a
+        different brain mid-derivation. The hint keeps a problem on one brain until
+        the person actually moves on; it is optional, so callers that don't track it
+        get exactly the previous behavior.
+        """
         text = user_input.strip()
         # Forgetting/curating memory is checked first (it's also "actiony"): only
         # the memory brain holds memory_forget, so this is where those turns must go.
         if _FORGET.search(text):
             return Routing(MEMORY, "memory curation — removing/correcting what's stored")
+        needs_tools = bool(_NEEDS_TOOLS.search(text))
+        # A closed problem goes to the toolless reasoning brain — but only when
+        # nothing in the turn needs the world outside the message. Checked ahead of
+        # _ACTIONY because that pattern matches "find", "check" and "calculate",
+        # which is how a pure algebra problem reached the full operator.
+        if not needs_tools:
+            if _is_problem(text):
+                return Routing(REASONING, "self-contained problem — derive and verify, no tools")
+            # Staying on reasoning for a challenge-shaped follow-up keeps "so what's
+            # the correct answer?" with the brain that has the derivation. A bare
+            # short turn counts too — but only if it isn't just social, or "thanks,
+            # night" after a solved problem would land on the reasoning brain.
+            if last_brain == REASONING.name and (
+                _FOLLOW_UP.search(text)
+                or (len(text.split()) <= 12 and not _SOCIAL.search(text))
+            ):
+                return Routing(REASONING, "follow-up on the problem the reasoning brain just solved")
         if _ACTIONY.search(text):
             return Routing(OPERATOR, "request implies a tool, memory op, or action")
         # A question is likely an information need (often memory/facts) — default to

@@ -15,6 +15,7 @@ cloud/local adapter, e.g. from `mikey reasoning-eval`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,11 @@ from core.orchestrator.tools import TOOLS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLDEN_PATH = REPO_ROOT / "evals" / "reasoning_golden.json"
+
+# Below this fraction of cases answered, a run is reported as inconclusive rather than
+# as a score. Two thirds is a judgement call, not a derived constant — it is simply
+# high enough that a mostly-rate-limited run can never masquerade as a measurement.
+MIN_COVERAGE = 2 / 3
 
 
 @dataclass
@@ -58,6 +64,36 @@ class ReasoningReport:
     @property
     def n(self) -> int:
         return len(self.results)
+
+    @property
+    def errored(self) -> list[CaseScore]:
+        """Cases the provider never answered — rate limits, outages, timeouts.
+
+        Kept separate from the pass rate on purpose. A run that scored "reason 0%"
+        because every call came back 429 says nothing about reasoning, and reading it
+        as a quality signal is how you'd "fix" a problem that was never there.
+        """
+        return [r for r in self.results if r.error]
+
+    @property
+    def scored(self) -> list[CaseScore]:
+        return [r for r in self.results if not r.error]
+
+    @property
+    def coverage(self) -> float:
+        """Fraction of cases the provider actually answered.
+
+        The pass rate is meaningless without this. Excluding unanswered cases from the
+        rate stops a rate limit from *understating* quality, but it lets it overstate
+        just as easily: a run where 14 of 15 cases 429'd reports "pass 100%" off a
+        single case. Callers must not present a rate whose coverage is this thin.
+        """
+        return len(self.scored) / self.n if self.n else 0.0
+
+    @property
+    def conclusive(self) -> bool:
+        """Whether enough cases were answered for the rate to mean anything."""
+        return self.coverage >= MIN_COVERAGE
 
 
 @dataclass
@@ -124,9 +160,19 @@ async def run_reasoning_eval(
     cases: list[ReasoningCase],
     system: str = SYSTEM_PROMPT,
     tools: list[dict[str, Any]] = TOOLS,
+    pace_s: float = 0.0,
 ) -> ReasoningReport:
+    """Score `cases` against one adapter.
+
+    `pace_s` waits between cases. A free-tier cloud key has a per-minute token budget
+    that a back-to-back run exhausts, after which every remaining case returns 429 —
+    a self-inflicted outage that reads exactly like a quality collapse in the table.
+    Defaults to 0 so scripted/offline runs stay instant.
+    """
     results: list[CaseScore] = []
-    for case in cases:
+    for i, case in enumerate(cases):
+        if pace_s and i:
+            await asyncio.sleep(pace_s)
         messages = [ChatMessage(role="user", text=case.input)]
         try:
             resp = await adapter.complete(system, messages, tools)
@@ -137,14 +183,16 @@ async def run_reasoning_eval(
             continue
         results.append(score_response(case, resp))
 
-    passed = sum(r.passed for r in results)
-    pass_rate = passed / len(results) if results else 0.0
-    by_category = _by_category(results)
+    # Rate over the cases the provider actually answered. An unanswered case is an
+    # infrastructure fact, not a wrong answer; averaging it in understates quality and
+    # invites "fixing" a problem the run never measured.
+    scored = [r for r in results if not r.error]
+    pass_rate = sum(r.passed for r in scored) / len(scored) if scored else 0.0
     return ReasoningReport(
         adapter=getattr(adapter, "name", "?"),
         results=results,
         pass_rate=pass_rate,
-        by_category=by_category,
+        by_category=_by_category(scored),
     )
 
 
@@ -154,10 +202,11 @@ async def shadow_compare(
     cases: list[ReasoningCase],
     system: str = SYSTEM_PROMPT,
     tools: list[dict[str, Any]] = TOOLS,
+    pace_s: float = 0.0,
 ) -> ShadowReport:
     """Run BOTH adapters over the same cases and compare. Never promotes."""
-    inc = await run_reasoning_eval(incumbent, cases, system, tools)
-    cand = await run_reasoning_eval(candidate, cases, system, tools)
+    inc = await run_reasoning_eval(incumbent, cases, system, tools, pace_s)
+    cand = await run_reasoning_eval(candidate, cases, system, tools, pace_s)
 
     inc_by_id = {r.id: r for r in inc.results}
     cand_by_id = {r.id: r for r in cand.results}
