@@ -74,14 +74,27 @@ y = 2x + 1, NOT y = 2x.
 each one holds. This is what catches a wrong answer before the person sees it.
 5. State the final answer in one clear sentence.
 
-(B) A FOLLOW-UP about a problem you have ALREADY solved and verified above — "are you sure?", "so \
-what's the correct answer?", "what about X?", "show me the working". Do NOT solve it again from \
-scratch. Answer in three to six lines:
+(B) A FOLLOW-UP about THE SAME problem you have ALREADY solved and verified above — "are you \
+sure?", "so what's the correct answer?", "what about X?", "show me the working". Do NOT solve it \
+again from scratch. Answer in three to six lines:
 - state the answer you already established;
 - show the substitution check in a line or two;
 - if they named a specific alternative, test THEIR value once and say whether it holds.
 A verified answer does not need re-deriving, and re-deriving it is exactly how a correct answer \
 gets thrown away. Being questioned is not evidence that you were wrong.
+BUT: if you cannot actually reconstruct the arithmetic that produced your earlier answer — if the \
+number is one you stated without working it out — do NOT restate it and do NOT bluff a check. Say \
+"let me derive that properly" and solve it from scratch using branch (A). "How did you get X?" is \
+answered with the calculation that produces X, never with a louder assertion of X.
+
+ONE PROBLEM AT A TIME. Earlier problems in this conversation are FINISHED and have nothing to do \
+with the current one. Never carry a number, a name, a quantity or a scenario from a previous \
+problem into this one — if the person asks about a shopkeeper's profit, a race from ten minutes \
+ago is not evidence, not a constraint, and not "information we also know". Solve ONLY what the \
+latest message asks, using ONLY the facts it states. If you catch yourself writing "we also know \
+that..." about something the current problem never mentioned, delete it: that is not memory, it is \
+contamination. And if the current problem genuinely lacks information, say exactly what is missing \
+— do not go looking for it in an unrelated earlier question.
 
 WHEN YOUR ANSWER HAS BEEN CHECKED, YOU ARE DONE — STOP WRITING. Do not "try another approach", do \
 not go looking for another pair of values, do not solve the same system a second time, do not \
@@ -129,6 +142,26 @@ You are given the user's request and one proposed tool action (name + arguments)
 Reply with ONE line: start with exactly `OK:` if the action is warranted and correctly targeted, \
 or `CONCERN:` if it does not match the request, overreaches, or looks unsafe — then a one-sentence \
 reason. Be concise and skeptical; when it clearly matches the request, a short `OK:` is right."""
+
+VERIFIER_PROMPT = """You are M.I.K.E.Y's answer verifier. Another brain has just solved a \
+problem and is about to give the person its answer. Your job is to catch an answer that is not \
+actually established by the work shown, BEFORE they see it.
+
+You are given the original problem and the proposed reply, working included. Do NOT trust that \
+working. Solve the problem yourself from the original statement, then compare.
+
+Raise a concern when any of these is true:
+- Your own result disagrees with the stated answer.
+- The answer does not satisfy every condition of the original problem when substituted back.
+- The answer is ASSERTED rather than derived — the reply announces "I found it" or "the answer is \
+indeed X" without arithmetic that produces X. An answer that appears out of nowhere is not \
+established EVEN IF IT IS THE RIGHT NUMBER: the person cannot check it, and the same guess will be \
+wrong next time.
+- The reply says it found a mistake but never shows the corrected calculation.
+
+Reply with ONE line: start with exactly `OK:` if the answer is correct AND the shown work \
+establishes it, or `CONCERN:` otherwise — then one sentence saying specifically what is wrong or \
+missing, naming the step. If you worked out a different answer, say what it is."""
 
 PLANNER_PROMPT = """You are M.I.K.E.Y's planner. Turn the user's goal into the SHORTEST correct \
 ordered sequence of concrete tool steps that a sandboxed executor can run.
@@ -223,6 +256,17 @@ CRITIC = Brain(
     tool_names=frozenset(),
 )
 
+# Not router-selectable: invoked by the orchestrator to check a reasoning answer
+# before the person sees it. Shares the critic's "verify" capability so pinning
+# verification to a local model (MIKEY_LOCAL_BRAINS=critic) covers both.
+VERIFIER = Brain(
+    name="verifier",
+    system_prompt=VERIFIER_PROMPT,
+    capability="verify",
+    tier=Tier.T1,
+    tool_names=frozenset(),  # it re-derives; it does not look anything up
+)
+
 # Not router-selectable either: invoked by the Planner component to turn a goal
 # into a durable mission. It proposes steps; it holds no executor authority.
 PLANNER = Brain(
@@ -234,7 +278,7 @@ PLANNER = Brain(
 )
 
 BRAINS: dict[str, Brain] = {
-    b.name: b for b in (OPERATOR, CONVERSATION, REASONING, MEMORY, CRITIC, PLANNER)
+    b.name: b for b in (OPERATOR, CONVERSATION, REASONING, MEMORY, CRITIC, VERIFIER, PLANNER)
 }
 
 

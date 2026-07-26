@@ -85,6 +85,13 @@ class Config:
     context_budget_chars: int = field(
         default_factory=lambda: int(os.environ.get("MIKEY_CONTEXT_CHARS", "10000"))
     )
+    # Independent verification of reasoning answers. "flagged" (default) spends a
+    # second model call only when the reply looks like an asserted-not-derived answer;
+    # "always" checks every reasoning answer (slower, costlier, catches more); "off"
+    # restores self-verification only. MIKEY_VERIFY_REASONING.
+    verify_reasoning: str = field(
+        default_factory=lambda: os.environ.get("MIKEY_VERIFY_REASONING", "flagged").lower()
+    )
     # Cost governor (Gen 3): USD of cloud inference allowed per calendar month.
     # Once it's spent, the gateway serves from the local model instead of the cloud
     # — spend stops, M.I.K.E.Y keeps working. Set MIKEY_MONTHLY_BUDGET_USD=0 to

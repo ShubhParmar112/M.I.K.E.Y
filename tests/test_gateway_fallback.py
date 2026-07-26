@@ -175,3 +175,45 @@ async def test_groq_auth_error_is_not_a_fallback_trigger() -> None:
     adapter = GroqAdapter("m", api_key="bad", transport=httpx.MockTransport(handler))
     with pytest.raises(httpx.HTTPStatusError):
         await adapter.complete("", _msgs(), [])
+
+
+def test_a_daily_cap_is_distinguished_from_a_momentary_one() -> None:
+    """Operationally opposite: a per-minute spike is worth waiting out, a per-day cap
+    means every remaining turn today is served by the fallback. Live, this was the
+    real cause of a bad evening — 98,372 of 100,000 daily tokens spent, so every
+    answer silently came from the 3B while the UI said "rate-limited"."""
+    from core.models.groq_adapter import _is_daily_limit
+
+    tpd = (
+        "rate limited (429) — Rate limit reached for model `llama-3.3-70b-versatile` "
+        "on tokens per day (TPD): Limit 100000, Used 98372, Requested 2875."
+    )
+    tpm = (
+        "rate limited (429) — Rate limit reached for model `llama-3.3-70b-versatile` "
+        "on tokens per minute (TPM): Limit 12000, Used 11500, Requested 2875."
+    )
+    assert _is_daily_limit(tpd) is True
+    assert _is_daily_limit(tpm) is False
+
+
+async def test_gateway_records_why_it_fell_back() -> None:
+    from core.models.gateway import ModelUnavailable
+
+    class _Exhausted:
+        name, local, model = "groq", False, "llama-3.3-70b-versatile"
+
+        async def complete(self, system, messages, tools):  # type: ignore[no-untyped-def]
+            raise ModelUnavailable("groq", "tokens per day (TPD) exceeded", daily=True)
+
+    class _Local:
+        name, local, model = "ollama", True, "llama3.2"
+
+        async def complete(self, system, messages, tools):  # type: ignore[no-untyped-def]
+            return ModelResponse(text="hi", tool_calls=[])
+
+    gateway = ModelGateway(_Exhausted(), fallbacks=[_Local()])
+    await gateway.complete("s", [ChatMessage(role="user", text="hi")], [])
+
+    assert gateway.last_provider == "ollama"
+    assert gateway.last_fallback_daily is True
+    assert "TPD" in (gateway.last_fallback_reason or "")

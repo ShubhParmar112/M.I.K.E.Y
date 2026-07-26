@@ -101,9 +101,18 @@ def _served_tag(ev: dict[str, Any], primary: str) -> str:
 
 def _fallback_subtitle(ev: dict[str, Any], primary: str) -> str | None:
     served = ev.get("served_by")
-    if served and served != primary:
-        return f"[yellow]on local model ({served}) — {primary} was rate-limited/offline[/yellow]"
-    return None
+    if not served or served == primary:
+        return None
+    if ev.get("quota_exhausted"):
+        # A daily cap is not a blip: every answer for the rest of the day comes from
+        # the small local model. Saying "rate-limited" here reads as "try again in a
+        # second" and leaves the person wondering why M.I.K.E.Y suddenly got worse.
+        return (
+            f"[red]{primary} is OUT OF QUOTA FOR TODAY — answers now come from "
+            f"{served}, a much weaker local model. Expect mistakes on anything "
+            "multi-step until the quota resets.[/red]"
+        )
+    return f"[yellow]on local model ({served}) — {primary} was rate-limited/offline[/yellow]"
 
 
 def _preview_block(preview: dict[str, Any] | None) -> tuple[str, str]:
@@ -156,9 +165,42 @@ def _handle_approval(client: httpx.Client, ev: dict[str, Any]) -> None:
     )
 
 
+def _new_session_id() -> str:
+    """A readable, unique id for one sitting."""
+    from core.events.schema import ulid
+
+    return f"chat-{time.strftime('%Y%m%d')}-{ulid()[-6:].lower()}"
+
+
+def _latest_session_id() -> str | None:
+    """The session of the most recent conversation turn, for `--continue`."""
+    try:
+        events = httpx.get(f"{BASE}/v1/events", params={"limit": 200}, timeout=5.0).json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    for ev in reversed(events.get("events", [])):  # newest last
+        if str(ev.get("type", "")).startswith("conversation.message"):
+            sid = ev.get("payload", {}).get("session_id")
+            if sid:
+                return str(sid)
+    return None
+
+
 @app.command()
-def chat(session: str = typer.Option("default", help="session id")) -> None:
-    """Interactive chat with approval cards."""
+def chat(
+    session: str = typer.Option("", help="resume a named session (default: start a new one)"),
+    resume: bool = typer.Option(
+        False, "--continue", "-c", help="continue the most recent conversation"
+    ),
+) -> None:
+    """Interactive chat with approval cards.
+
+    Every run starts a NEW conversation unless you ask otherwise. It used to reuse
+    one session id forever, so a fresh chat silently inherited the previous one's
+    history — the reason an unrelated question could drag a half-finished problem
+    into its reasoning. Long-term memory is unaffected: a new chat still recalls
+    what you've told M.I.K.E.Y before, it just doesn't replay the last conversation.
+    """
     _ensure_server()
     health = httpx.get(f"{BASE}/v1/health", timeout=5.0).json()
     primary = health["provider"]
@@ -169,12 +211,24 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
     local_brains = health.get("local_brains") or []
     if local_brains:
         provider_line += f" [green](local: {', '.join(local_brains)})[/green]"
+
+    if session:
+        continuing = True
+    elif resume:
+        session, continuing = _latest_session_id() or _new_session_id(), True
+    else:
+        session, continuing = _new_session_id(), False
+    session_line = (
+        f"[yellow]continuing[/yellow] {session}" if continuing
+        else f"[green]new conversation[/green] {session}"
+    )
     console.print(
         Panel(
             f"{provider_line} · "
             f"build: {health.get('build', '?')} · "
             f"audit chain: {'[green]valid[/green]' if health['audit_chain_valid'] else '[red]BROKEN[/red]'} · "
-            f"workspace: {CONFIG.workspace}",
+            f"workspace: {CONFIG.workspace}\n"
+            f"{session_line} [dim]· /new starts another · /quit to leave[/dim]",
             title="M.I.K.E.Y",
         )
     )
@@ -187,6 +241,14 @@ def chat(session: str = typer.Option("default", help="session id")) -> None:
                 console.print("\n[dim]bye[/dim]")
                 return
             if not user_input:
+                continue
+            if user_input == "/new":
+                session = _new_session_id()
+                last_turn = None
+                console.print(
+                    f"[green]new conversation[/green] {session} "
+                    "[dim]— previous turns are no longer in context (memory is)[/dim]"
+                )
                 continue
             if user_input in ("/quit", "/exit"):
                 return

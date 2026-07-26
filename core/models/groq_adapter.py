@@ -77,6 +77,14 @@ def _rate_limit_reason(resp: httpx.Response) -> str:
     return f"rate limited (429) — {message}"
 
 
+_DAILY_LIMIT_RE = re.compile(r"per day|\bTPD\b|\bRPD\b", re.IGNORECASE)
+
+
+def _is_daily_limit(reason: str) -> bool:
+    """Whether a 429 means "finished for today" rather than "slow down"."""
+    return bool(_DAILY_LIMIT_RE.search(reason))
+
+
 def _retry_after(resp: httpx.Response) -> float | None:
     raw = resp.headers.get("retry-after")
     if not raw:
@@ -243,7 +251,14 @@ class GroqAdapter:
                     raise ModelUnavailable(
                         "groq", f"unreachable ({type(exc).__name__})"
                     ) from exc
-                if resp.status_code == 429 and rl < self._rl_retries:
+                if (
+                    resp.status_code == 429
+                    and rl < self._rl_retries
+                    # Waiting out a per-minute spike is worth ~15s for the better
+                    # model. Waiting out a DAILY cap is 15s of dead time on every
+                    # remaining turn of the day, and it still ends in the fallback.
+                    and not _is_daily_limit(_rate_limit_reason(resp))
+                ):
                     delay = min(
                         _retry_after(resp) or self._rl_backoff * (rl + 1),
                         MAX_RATE_LIMIT_BACKOFF_S,
@@ -254,8 +269,10 @@ class GroqAdapter:
             # Rate limit (after backoff) and server errors are what the local
             # fallback exists for; auth/other 4xx are not (that hides a real bug).
             if resp.status_code == 429:
+                reason = _rate_limit_reason(resp)
                 raise ModelUnavailable(
-                    "groq", _rate_limit_reason(resp), retry_after=_retry_after(resp)
+                    "groq", reason, retry_after=_retry_after(resp),
+                    daily=_is_daily_limit(reason),
                 )
             if resp.status_code >= 500:
                 raise ModelUnavailable("groq", f"server error ({resp.status_code})")

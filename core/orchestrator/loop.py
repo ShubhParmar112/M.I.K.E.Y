@@ -20,6 +20,8 @@ from core.events.schema import Event, EventType, Provenance, Tier, now, ulid
 from core.executor_client import ExecResult, ExecutorClient
 from core.memory.provenance import annotate
 from core.memory.store import MemoryStore
+from core.models.arithmetic import arithmetic_errors
+from core.models.degeneration import unsupported_answer
 from core.models.gateway import ChatMessage, ModelGateway, RoutingMeta
 from core.orchestrator.brains import Router
 from core.orchestrator.critic import Critic
@@ -122,7 +124,9 @@ class Orchestrator:
         # Assemble BEFORE recording the new user message, or it would appear in
         # the history AND as the final message (duplicated context). The brain's
         # own prompt is the base; memories are injected onto it either way.
-        ctx = self._assembler.assemble(user_input, base_system=brain.system_prompt)
+        ctx = self._assembler.assemble(
+            user_input, session_id=session_id, base_system=brain.system_prompt
+        )
         self._memory.record(
             Event(
                 type=EventType.USER_MESSAGE.value,
@@ -193,6 +197,10 @@ class Orchestrator:
             )
 
             if not resp.tool_calls:
+                text, verification = await self._verified_answer(
+                    brain=brain, question=user_input, answer=resp.text, system=ctx.system,
+                    messages=messages, meta=meta, turn_id=turn_id, root=root, tier=tier,
+                )
                 self._memory.record(
                     Event(
                         type=EventType.ASSISTANT_MESSAGE.value,
@@ -200,15 +208,18 @@ class Orchestrator:
                         tier=tier,
                         provenance=Provenance(source="agent", trusted=True),
                         payload={
-                            "text": resp.text, "session_id": session_id,
+                            "text": text, "session_id": session_id,
                             "turn_id": turn_id, "brain": brain.name,
                         },
                     )
                 )
                 yield StreamEvent(
                     "final",
-                    {"text": resp.text, "turn_id": turn_id,
-                     "served_by": self._gateway.last_provider},
+                    {"text": text, "turn_id": turn_id,
+                     "served_by": self._gateway.last_provider,
+                     "quota_exhausted": self._gateway.last_fallback_daily,
+                     "fallback_reason": self._gateway.last_fallback_reason,
+                     **verification},
                 )
                 return
 
@@ -430,6 +441,174 @@ class Orchestrator:
         yield StreamEvent(
             "error",
             {"message": f"turn exceeded {MAX_STEPS} steps and was stopped (runaway guard)"},
+        )
+
+    async def _verified_answer(
+        self,
+        *,
+        brain: Any,
+        question: str,
+        answer: str,
+        system: str,
+        messages: list[ChatMessage],
+        meta: RoutingMeta,
+        turn_id: str,
+        root: str,
+        tier: Tier,
+    ) -> tuple[str, dict[str, Any]]:
+        """Check a reasoning answer with an independent brain, and give the person a
+        derivation rather than an assertion.
+
+        Only the reasoning brain is checked: a greeting or a memory lookup has nothing
+        to verify. By default the second call is spent only when `unsupported_answer`
+        flags the reply, so a healthy derivation costs nothing extra.
+
+        The outcome is never silently swallowed. If re-deriving still fails the check,
+        the answer ships with the concern attached — "here is my answer and I could not
+        confirm it" is worth far more than a confident number nobody can check.
+        """
+        mode = self._config.verify_reasoning
+        if self._critic is None or mode == "off" or brain.name != "reasoning":
+            return answer, {}
+        flagged = unsupported_answer(answer)
+        bad_math = arithmetic_errors(answer)
+        if mode != "always" and not flagged and not bad_math:
+            return answer, {}
+
+        # Arithmetic that does not hold is PROOF, not an opinion, so it goes straight
+        # to a re-derivation naming the false steps. Asking a model whether 0.92 ×
+        # 34,240 is 17,940 would be slower, cost a call, and — on the model that just
+        # wrote it — is exactly the judgement we cannot trust.
+        if bad_math:
+            self._traces.span(
+                turn_id,
+                "arithmetic_audit",
+                {"errors": [str(b) for b in bad_math]},
+                parent_id=root,
+            )
+            concern = "the working contains arithmetic that does not hold — " + "; ".join(
+                str(b) for b in bad_math
+            )
+            return await self._re_derive(
+                question=question, answer=answer, concern=concern, system=system,
+                messages=messages, meta=meta, turn_id=turn_id, root=root, tier=tier,
+            )
+
+        verdict = await self._critic.verify_answer(question=question, answer=answer, tier=tier)
+        self._traces.span(
+            turn_id,
+            "verify_answer",
+            {"attempt": 1, "flagged_unsupported": flagged,
+             "sound": verdict.sound, "parsed": verdict.parsed, "note": verdict.note},
+            parent_id=root,
+        )
+        if not verdict.parsed:
+            # No usable verdict — the verifier was down, or (seen live on the local
+            # 3B) too weak to produce one. Re-deriving on a critique that doesn't
+            # exist would just burn calls, so stop here and be straight about it:
+            # unchecked is reported as unchecked, never as verified.
+            if flagged:
+                return (
+                    answer
+                    + "\n\n[I could not get an independent check on this working, and it "
+                    "reads as asserted rather than derived. Treat the answer as unverified.]",
+                    {"verified": None, "verifier_note": verdict.note},
+                )
+            return answer, {"verified": None}
+        if verdict.sound:
+            return answer, {"verified": True}
+        return await self._re_derive(
+            question=question, answer=answer, concern=verdict.note, system=system,
+            messages=messages, meta=meta, turn_id=turn_id, root=root, tier=tier,
+        )
+
+    async def _re_derive(
+        self,
+        *,
+        question: str,
+        answer: str,
+        concern: str,
+        system: str,
+        messages: list[ChatMessage],
+        meta: RoutingMeta,
+        turn_id: str,
+        root: str,
+        tier: Tier,
+    ) -> tuple[str, dict[str, Any]]:
+        """One bounded second attempt, with the specific concern handed back.
+
+        Bounded because a model that cannot establish the answer twice will not
+        establish it on the fifth try — it will just spend the person's tokens
+        looking busy.
+        """
+        assert self._critic is not None
+        messages.append(
+            ChatMessage(
+                role="user",
+                text=(
+                    f"A check of your reply found this: {concern}\n\n"
+                    "Re-derive the answer from the ORIGINAL problem statement, showing every "
+                    "step of arithmetic that produces it, and compute each step rather than "
+                    "asserting it. Do not state a number you have not worked out in front of "
+                    "me, and do not claim a check passes without showing both sides of it. If "
+                    "you cannot establish the answer, say so plainly instead of asserting one."
+                ),
+            )
+        )
+        try:
+            retry = await self._gateway.complete(system, messages, [], meta)
+        except Exception as exc:
+            self._traces.span(
+                turn_id, "verify_answer", {"attempt": 2, "error": str(exc)}, parent_id=root
+            )
+            return answer, {"verified": False, "verifier_note": concern}
+
+        # Audit the new arithmetic before spending a verifier call on it: if the
+        # second attempt is still provably wrong, no second opinion is needed.
+        retry_math = arithmetic_errors(retry.text)
+        if retry_math:
+            self._traces.span(
+                turn_id,
+                "arithmetic_audit",
+                {"attempt": 2, "errors": [str(b) for b in retry_math]},
+                parent_id=root,
+            )
+            detail = "; ".join(str(b) for b in retry_math)
+            return (
+                retry.text
+                + f"\n\n[I could not confirm this working — it still contains arithmetic that "
+                f"does not hold: {detail}. Treat the answer as unverified.]",
+                {"verified": False, "re_derived": True, "verifier_note": detail},
+            )
+
+        second = await self._critic.verify_answer(
+            question=question, answer=retry.text, tier=tier
+        )
+        self._traces.span(
+            turn_id,
+            "verify_answer",
+            {"attempt": 2, "sound": second.sound, "parsed": second.parsed, "note": second.note},
+            parent_id=root,
+        )
+        # Only an explicit `OK:` counts as confirmation — a verifier that produced no
+        # usable verdict must not be read as one.
+        if second.parsed and second.sound:
+            return retry.text, {"verified": True, "re_derived": True}
+        detail = (
+            f"an independent check still flags: {second.note}"
+            if second.parsed
+            else "I could not get a usable second opinion on it"
+        )
+        return (
+            retry.text
+            + f"\n\n[I could not confirm this working — {detail}. "
+            "Treat the answer as unverified.]",
+            {
+                # False = checked and found wanting; None = could not be checked.
+                "verified": False if second.parsed else None,
+                "re_derived": True,
+                "verifier_note": second.note,
+            },
         )
 
     def _last_brain(self, session_id: str) -> str | None:

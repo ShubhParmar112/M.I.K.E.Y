@@ -67,11 +67,23 @@ class ModelUnavailable(Exception):
     fallback would NOT fix — bad API key, malformed request — stay as their own
     exceptions and are not caught here."""
 
-    def __init__(self, provider: str, reason: str, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        provider: str,
+        reason: str,
+        retry_after: float | None = None,
+        daily: bool = False,
+    ) -> None:
         super().__init__(f"{provider} unavailable: {reason}")
         self.provider = provider
         self.reason = reason
         self.retry_after = retry_after
+        # True when the provider is out for the DAY, not for a moment. The two are
+        # operationally opposite: a per-minute spike is worth waiting out, a daily
+        # cap means every remaining turn today is served by the fallback and the
+        # person should be told plainly rather than left wondering why answers got
+        # worse. Retrying a daily cap is pure dead time.
+        self.daily = daily
 
 
 class ModelAdapter(Protocol):
@@ -142,6 +154,11 @@ class ModelGateway:
         self.total_calls = 0
         # Which adapter actually served the last completion (for traces/health).
         self.last_provider = adapter.name
+        # Why the primary was skipped, when it was — so the surface can tell the
+        # person "rate-limited for a moment" apart from "out of quota until tomorrow,
+        # everything you ask today comes from the weaker model".
+        self.last_fallback_reason: str | None = None
+        self.last_fallback_daily = False
 
     @property
     def routed_capabilities(self) -> dict[str, str]:
@@ -211,6 +228,8 @@ class ModelGateway:
             try:
                 resp = await adapter.complete(system, messages, tools)
                 self.last_provider = adapter.name
+                self.last_fallback_reason = errors[0].reason if errors else None
+                self.last_fallback_daily = bool(errors and errors[0].daily)
                 if self._governor is not None:
                     # Bill the adapter that actually served, not the one asked —
                     # a fallback to local is genuinely free and must read as free.

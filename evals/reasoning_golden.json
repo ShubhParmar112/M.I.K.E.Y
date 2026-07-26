@@ -1,21 +1,145 @@
 {
-  "_reason_comment": "The `reason` cases encode a live failure (2026-07-26): a ratio word problem routed to the tool-holding operator, which fired memory_recall on a self-contained question and then guessed 12 and 24 - the answer is 35 and 71. Each asserts BOTH that no tool was called and that the correct value appears, so a confident wrong answer fails as loudly as a wrong tool call. The last one checks the model holds a verified answer under pushback rather than caving to it.",
+  "_reason_comment": "The `reason` cases encode a live failure (2026-07-26): a ratio word problem routed to the tool-holding operator, which fired memory_recall on a self-contained question and then guessed 12 and 24 - the answer is 35 and 71. Each asserts BOTH that no tool was called and that the correct value appears, so a confident wrong answer fails as loudly as a wrong tool call. The last one checks the model holds a verified answer under pushback rather than caving to it. The `race_beats_*` cases encode a second live failure (2026-07-27, served by the local 3B): asked 'A beats B by 20 m, B beats C by 10 m', M.I.K.E.Y stated the correct 29 but could not derive it - it retracted twice, computed 8.2, then asserted 'Ah-ha! I found it! The correct answer is indeed: 29'. The `_explain` case demands the intermediate 171 (C's distance when A finishes) as well as the answer, so a recalled number without the derivation FAILS - which is the actual defect.",
   "_comment": "End-to-end tool-use golden set (sovereignty S0). Each case scores ONE model call given the real system prompt + TOOLS: did the model reach for the right tool (or correctly answer with none)? This is the instrument that decides whether a local brain is good enough to replace a cloud one — grow it from your own real corrections. `expect_tool`: the tool the model should call. `expect_no_tool`: true when a plain reply is correct (greetings, arithmetic). `expect_contains`: substrings that must appear in the reply text (lowercased match).",
   "cases": [
-    {"id": "greet", "input": "hey mikey, morning", "expect_no_tool": true, "category": "chat"},
-    {"id": "smalltalk", "input": "how are you doing today?", "expect_no_tool": true, "category": "chat"},
-    {"id": "arithmetic", "input": "what's 17 times 3?", "expect_no_tool": true, "expect_contains": ["51"], "category": "chat"},
-    {"id": "recall_past", "input": "what did I tell you earlier about my thesis advisor?", "expect_tool": "memory_recall", "category": "memory"},
-    {"id": "recall_pref", "input": "remind me which cloud model we decided to use", "expect_tool": "memory_recall", "category": "memory"},
-    {"id": "remember_fact", "input": "remember that my paper deadline is November 15th", "expect_tool": "memory_remember", "category": "memory"},
-    {"id": "list_workspace", "input": "what files are in my workspace?", "expect_tool": "fs_list", "category": "tool"},
-    {"id": "read_file", "input": "read the file notes.md and summarise it", "expect_tool": "fs_read", "category": "tool"},
-    {"id": "fetch_url", "input": "fetch https://example.com and tell me the page title", "expect_tool": "web_fetch", "category": "tool"},
-    {"id": "ingest_pdf", "input": "ingest the pdf at C:/papers/mmp.pdf into your memory", "expect_tool": "ingest", "category": "tool"},
-    {"id": "ratio_word_problem", "input": "if 1 is added to each of two certain numbers, their ratio is 1:2; and if 5 is subtracted from each of the two numbers their ratio becomes 5:11. Find the numbers", "expect_no_tool": true, "expect_contains": ["35", "71"], "category": "reason"},
-    {"id": "linear_solve", "input": "solve for x: 3(x - 4) = 2x + 7", "expect_no_tool": true, "expect_contains": ["19"], "category": "reason"},
-    {"id": "age_word_problem", "input": "A father is three times as old as his son. In 12 years he will be twice as old as his son. How old are they now?", "expect_no_tool": true, "expect_contains": ["36", "12"], "category": "reason"},
-    {"id": "speed_word_problem", "input": "A train covers 240 km in 3 hours. What is its average speed in km/h?", "expect_no_tool": true, "expect_contains": ["80"], "category": "reason"},
-    {"id": "challenge_holds_verified_answer", "input": "You said the numbers satisfying (x+1):(y+1) = 1:2 and (x-5):(y-5) = 5:11 are 35 and 71. Are you sure? I think it's 12 and 24.", "expect_no_tool": true, "expect_contains": ["35", "71"], "category": "reason"}
+    {
+      "id": "greet",
+      "input": "hey mikey, morning",
+      "expect_no_tool": true,
+      "category": "chat"
+    },
+    {
+      "id": "smalltalk",
+      "input": "how are you doing today?",
+      "expect_no_tool": true,
+      "category": "chat"
+    },
+    {
+      "id": "arithmetic",
+      "input": "what's 17 times 3?",
+      "expect_no_tool": true,
+      "expect_contains": [
+        "51"
+      ],
+      "category": "chat"
+    },
+    {
+      "id": "recall_past",
+      "input": "what did I tell you earlier about my thesis advisor?",
+      "expect_tool": "memory_recall",
+      "category": "memory"
+    },
+    {
+      "id": "recall_pref",
+      "input": "remind me which cloud model we decided to use",
+      "expect_tool": "memory_recall",
+      "category": "memory"
+    },
+    {
+      "id": "remember_fact",
+      "input": "remember that my paper deadline is November 15th",
+      "expect_tool": "memory_remember",
+      "category": "memory"
+    },
+    {
+      "id": "list_workspace",
+      "input": "what files are in my workspace?",
+      "expect_tool": "fs_list",
+      "category": "tool"
+    },
+    {
+      "id": "read_file",
+      "input": "read the file notes.md and summarise it",
+      "expect_tool": "fs_read",
+      "category": "tool"
+    },
+    {
+      "id": "fetch_url",
+      "input": "fetch https://example.com and tell me the page title",
+      "expect_tool": "web_fetch",
+      "category": "tool"
+    },
+    {
+      "id": "ingest_pdf",
+      "input": "ingest the pdf at C:/papers/mmp.pdf into your memory",
+      "expect_tool": "ingest",
+      "category": "tool"
+    },
+    {
+      "id": "ratio_word_problem",
+      "input": "if 1 is added to each of two certain numbers, their ratio is 1:2; and if 5 is subtracted from each of the two numbers their ratio becomes 5:11. Find the numbers",
+      "expect_no_tool": true,
+      "expect_contains": [
+        "35",
+        "71"
+      ],
+      "category": "reason"
+    },
+    {
+      "id": "linear_solve",
+      "input": "solve for x: 3(x - 4) = 2x + 7",
+      "expect_no_tool": true,
+      "expect_contains": [
+        "19"
+      ],
+      "category": "reason"
+    },
+    {
+      "id": "age_word_problem",
+      "input": "A father is three times as old as his son. In 12 years he will be twice as old as his son. How old are they now?",
+      "expect_no_tool": true,
+      "expect_contains": [
+        "36",
+        "12"
+      ],
+      "category": "reason"
+    },
+    {
+      "id": "speed_word_problem",
+      "input": "A train covers 240 km in 3 hours. What is its average speed in km/h?",
+      "expect_no_tool": true,
+      "expect_contains": [
+        "80"
+      ],
+      "category": "reason"
+    },
+    {
+      "id": "challenge_holds_verified_answer",
+      "input": "You said the numbers satisfying (x+1):(y+1) = 1:2 and (x-5):(y-5) = 5:11 are 35 and 71. Are you sure? I think it's 12 and 24.",
+      "expect_no_tool": true,
+      "expect_contains": [
+        "35",
+        "71"
+      ],
+      "category": "reason"
+    },
+    {
+      "id": "race_beats_compound",
+      "input": "In a 200 m race A beats B by 20 m, and B beats C by 10 m. By how many metres does A beat C?",
+      "expect_no_tool": true,
+      "expect_contains": [
+        "29"
+      ],
+      "category": "reason"
+    },
+    {
+      "id": "race_beats_compound_explain",
+      "input": "In a 200 m race A beats B by 20 m, and B beats C by 10 m. By how many metres does A beat C? Show the working step by step.",
+      "expect_no_tool": true,
+      "expect_contains": [
+        "171",
+        "29"
+      ],
+      "category": "reason"
+    },
+    {
+      "id": "race_beats_single",
+      "input": "In a 100 m race A beats B by 5 m. When A has run 100 m, how far has B run?",
+      "expect_no_tool": true,
+      "expect_contains": [
+        "95"
+      ],
+      "category": "reason"
+    }
   ]
 }

@@ -144,6 +144,62 @@ def trim_restart(text: str) -> tuple[str, bool]:
     return text, False
 
 
+# The third way a reply runs away, and the most dangerous, because it looks like an
+# answer: the model retracts its own work and then simply *asserts* a result it never
+# computed. Observed live on "A beats B by 20m, B beats C by 10m — by how much does A
+# beat C?", served by the local 3B:
+#
+#     "...200 - 191.8 = 8.2 meters
+#      However, I made another mistake earlier.
+#      Let me re-evaluate again...
+#       Ah-ha! I found it!
+#      The correct answer is indeed: 29"
+#
+# 29 is the right answer — recalled, not derived. Neither `collapse_score` nor
+# `trim_restart` fires (both score 0.0 on it): there is no repetition, and the work
+# before the restart was wrong, so trimming to it would have been worse. What gives it
+# away is structural — after the last retraction the reply contains an answer and no
+# arithmetic that could produce one. A correct answer nobody can check is still a
+# failure, and it is invisible until someone asks "how did you get that?".
+_RETRACTION_RE = re.compile(
+    r"(?:\bi (?:made|had) (?:a|an|another) (?:mistake|error)\b"
+    r"|\bi was wrong\b"
+    r"|\bthat'?s (?:not right|incorrect|wrong)\b"
+    r"|\blet me (?:re-?evaluate|reconsider|re-?check|re-?do|start over|try again)\b"
+    r"|\bscratch that\b"
+    r"|\bcorrection\b)",
+    re.IGNORECASE,
+)
+_ASSERTION_RE = re.compile(
+    r"(?:\bthe (?:correct |right )?answer is\b|\bfinal answer\b|\bit is indeed\b"
+    r"|\bi (?:found|got) it\b|\bah-?ha\b)",
+    re.IGNORECASE,
+)
+# Actual work: a number, an operator or relation, another number. "200 - 171 = 29"
+# counts; "the correct answer is indeed: 29" does not, which is the whole point.
+_COMPUTATION_RE = re.compile(r"\d[^\n]{0,60}?[=+\-*/×÷≈:][^\n]{0,60}?\d")
+
+
+def unsupported_answer(text: str) -> bool:
+    """True when a reply abandons its working and then states an answer it never
+    computed.
+
+    Looks only at what follows the LAST retraction: if the model corrected itself and
+    then showed the corrected arithmetic, the answer is supported and this stays
+    quiet. It fires only on the "…I found it! The answer is 29" shape, where an
+    assertion stands in for a derivation.
+    """
+    if "```" in text:
+        return False
+    retractions = list(_RETRACTION_RE.finditer(text))
+    if not retractions:
+        return False
+    tail = text[retractions[-1].end() :]
+    if not _ASSERTION_RE.search(tail):
+        return False
+    return not _COMPUTATION_RE.search(tail)
+
+
 def is_degenerate(text: str, threshold: float = DEFAULT_THRESHOLD) -> bool:
     """True when `text` looks like a repetition collapse rather than an answer.
 

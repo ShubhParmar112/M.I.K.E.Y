@@ -20,13 +20,20 @@ from typing import Any
 
 from core.events.schema import Tier
 from core.models.gateway import ChatMessage, ModelGateway, RoutingMeta
-from core.orchestrator.brains import CRITIC
+from core.orchestrator.brains import CRITIC, VERIFIER
 
 
 @dataclass(frozen=True)
 class Verdict:
     sound: bool  # does the action faithfully serve the user's request?
     note: str    # one-line rationale, shown on the approval card
+    # False when the verifier answered with neither `OK:` nor `CONCERN:` — it
+    # rambled, or produced its own derivation instead of a verdict. `sound` is then
+    # a DEFAULT, not a judgement, and callers must not report it as confirmation.
+    # Live on the local 3B: asked to check a wildly wrong answer it never emitted a
+    # verdict line, which read as "verified" — a verifier that cannot be understood
+    # rubber-stamps everything.
+    parsed: bool = True
 
 
 class Critic:
@@ -62,12 +69,54 @@ class Critic:
             )
         return _parse(resp.text)
 
+    async def verify_answer(
+        self, *, question: str, answer: str, tier: Tier = Tier.T1
+    ) -> Verdict:
+        """Independently check a reasoning answer before the person sees it.
+
+        The reasoning brain is prompted to verify its own result, and on a weak model
+        that check is theatre — a live turn produced "Let me re-evaluate again... Ah-ha!
+        I found it! The correct answer is indeed: 29" with no arithmetic behind it.
+        docs/04 §5 is explicit that self-grading in the same context is the weak form;
+        this is the separate call it asks for, with the original problem and none of
+        the first brain's reasoning to anchor on.
+        """
+        detail = (
+            f"Original problem:\n{question}\n\n"
+            f"Proposed reply (working included):\n{answer}"
+        )
+        try:
+            resp = await self._gateway.complete(
+                VERIFIER.system_prompt,
+                [ChatMessage(role="user", text=detail)],
+                [],
+                RoutingMeta(tier=tier, capability=VERIFIER.capability),
+            )
+        except Exception:
+            # A verifier that is down must never block an answer — the person gets
+            # the unverified reply, exactly as they would have before this existed.
+            return Verdict(
+                sound=True,
+                note="verifier unavailable — answer not independently checked",
+                parsed=False,  # an absent verifier is not a clean bill of health
+            )
+        return _parse(resp.text)
+
 
 def _parse(text: str) -> Verdict:
     """Read the verdict off the first non-empty line: `CONCERN: ...` or `OK: ...`.
-    Anything unparseable is treated as no clear concern (advisory, never a false block)."""
+
+    Anything else still defaults to "no clear concern" — for the ACTION critic that is
+    right, since it is advisory and must never turn a garbled reply into a false block.
+    But the default is now marked `parsed=False` so answer verification, where the
+    stakes run the other way, can tell "checked and sound" apart from "no usable
+    verdict" instead of reporting the second as the first.
+    """
     line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
     body = line.split(":", 1)[1].strip() if ":" in line else line
-    if line.upper().startswith("CONCERN"):
+    upper = line.upper()
+    if upper.startswith("CONCERN"):
         return Verdict(sound=False, note=body or "the action may not match the request")
-    return Verdict(sound=True, note=body or "looks consistent with the request")
+    if upper.startswith("OK"):
+        return Verdict(sound=True, note=body or "looks consistent with the request")
+    return Verdict(sound=True, note=body or "no verdict given", parsed=False)

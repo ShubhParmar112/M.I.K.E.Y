@@ -24,7 +24,7 @@ This repository contains a working **Gen 1–3 core** — append-only event log,
 
 ```powershell
 uv sync                      # install
-uv run pytest                # verify (262 passing)
+uv run pytest                # verify (273 passing)
 
 # pick a model provider (any of the three):
 $env:GROQ_API_KEY = "gsk_..."               # cloud (Groq, free tier, Llama 3.3), or:
@@ -49,7 +49,7 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 
 | Command | What it does |
 |---|---|
-| `mikey chat` | Interactive session — routes each turn through the brain fleet, streams actions + approval cards (with the critic's note), header shows which brains run locally. `/trace` and `/quit` work inside. |
+| `mikey chat` | Interactive session — routes each turn through the brain fleet, streams actions + approval cards (with the critic's note), header shows which brains run locally. **Each run is a new conversation**; `--continue` resumes the last one, `--session <id>` names one. `/new`, `/trace` and `/quit` work inside. |
 | `mikey serve` | Run the gateway in the foreground (for a separate terminal). |
 | `mikey trace [turn_id]` | "Why did you do that?" — the full reasoning tree for a turn (route → model call → policy → tool). Defaults to the last turn. |
 | `mikey events [--limit N]` | Recent raw events from the append-only log. |
@@ -140,12 +140,27 @@ Every turn is routed to one of a small fleet of **brains** — each a capability
 | `operator` | actionable turns, questions, recall/remember | all except `memory_forget` |
 | `memory` | forgetting / correcting stored memory | recall, remember, forget |
 | `critic` | reviews a risky action before you approve it | none (judges) |
+| `verifier` | independently re-checks a reasoning answer before you see it | none (re-derives) |
 | `planner` | turns a goal into a durable mission | none (proposes) |
 | `router` | picks the brain per turn | heuristic (always local) |
 
 A self-contained problem goes to `reasoning`, which holds **no tools** — so a lookup can't stand in for the algebra — and is prompted to derive, substitute its answer back into the original conditions, and stop once the check passes. Routing is sticky across a problem: the "are you sure?" that follows stays on the same brain instead of switching mid-derivation.
 
-Model replies are also screened for the two ways an open-weight model runs away instead of answering: a **repetition collapse** (re-sampled once with anti-repetition settings) and a **restart after the answer** — "let's try another approach" followed by guessed values — which is trimmed. Both are recorded in the turn's trace, so a recovered reply is visible rather than silently smoothed over.
+Model replies are also screened for the three ways an open-weight model runs away instead of answering: a **repetition collapse** (re-sampled once with anti-repetition settings), a **restart after the answer** — "let's try another approach" followed by guessed values — which is trimmed, and an **asserted answer**: the reply retracts its own working and then simply announces a result it never computed ("Let me re-evaluate again… Ah-ha! I found it! The answer is indeed 29"). All three are recorded in the turn's trace, so a recovered reply is visible rather than silently smoothed over.
+
+An asserted answer is the dangerous one, because it can be *right* — recalled from training data rather than derived — and it only falls apart when you ask "how did you get that?". So a flagged answer is handed to the **verifier**, a separate brain that gets the original problem and none of the first brain's reasoning, and is asked whether the working actually establishes the answer. If it doesn't, M.I.K.E.Y re-derives once with the concern fed back; if the check still fails, the answer ships with the concern attached rather than as a confident number nobody can check. `MIKEY_VERIFY_REASONING` = `flagged` (default — a second call only when the reply looks asserted), `always`, or `off`.
+
+Before any of that costs a model call, the reply's own arithmetic is **audited
+deterministically** (`core/models/arithmetic.py`): every claim of the form
+`<arithmetic> = <number>` is extracted and evaluated, so `(0.92 × 34,240) = Rs.
+17,940 (True)` is caught as the false step it is — instantly, free, and just as
+reliably on a 3B as on a 70B. Arithmetic that doesn't hold is proof rather than
+opinion, so it goes straight to a re-derivation naming the bad steps instead of
+asking a model to grade the sum it just got wrong. Claims involving a symbol
+(`M − 16,300 = 17,940`) are skipped: a false accusation would teach you to ignore
+the warnings, so the check only fires on what it can prove.
+
+Verification is deliberately three-valued — **confirmed**, **checked and found wanting**, and **could not be checked** — because a verifier that is down, or too weak to return a verdict at all, must never be mistaken for a clean bill of health. Only an explicit verdict counts as confirmation; anything else reaches you as "treat this as unverified". A weak local model verifying itself is the case this guards against, and it is a real one.
 
 Brains are served by a **cloud primary with a local (Ollama) fallback** — auto-routing to Ollama on rate-limit/offline. Any brain can also be pinned **on-device**, one at a time, so its calls never leave the machine:
 

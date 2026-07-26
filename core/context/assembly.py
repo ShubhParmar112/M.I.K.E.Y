@@ -11,8 +11,9 @@ flagging, memory tiers with promotion.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 
-from core.events.schema import EventType
+from core.events.schema import EventType, now
 from core.events.store import EventStore
 from core.memory.provenance import annotate
 from core.memory.store import MemoryHit, MemoryStore
@@ -96,6 +97,16 @@ MEMORY_BUDGET_CHARS = 2_500
 MEMORY_SNIPPET_CHARS = 500
 MEMORY_RECALL_K = 3
 
+# How many conversation events to pull before filtering down to this session.
+# Larger than the number that can survive the budget, so a busy neighbouring
+# session cannot starve this one's history out of the window.
+HISTORY_FETCH = 300
+# A gap this long between consecutive messages means the person left and came
+# back: everything before it belongs to an earlier sitting and is dropped. This
+# is the SECONDARY boundary — the session id is the primary one — so it is set
+# generously, to catch "resumed it the next morning" rather than to police pauses.
+SITTING_GAP = timedelta(hours=6)
+
 
 @dataclass
 class AssembledContext:
@@ -111,18 +122,36 @@ class ContextAssembler:
         self._memory = memory
         self._budget = budget_chars
 
-    def assemble(self, user_input: str, base_system: str = SYSTEM_PROMPT) -> AssembledContext:
-        # `base_system` is the routed brain's own prompt (S1); memories are then
-        # injected onto it, identically for every brain. Defaults to the operator
-        # prompt so existing callers are unaffected.
+    def assemble(
+        self, user_input: str, *, session_id: str, base_system: str = SYSTEM_PROMPT
+    ) -> AssembledContext:
+        """Build one turn's context.
+
+        `session_id` is REQUIRED and filters the history, because conversation
+        history is per-conversation by definition. It used to be omitted entirely —
+        every turn saw the last 40 messages from *every* session — which is how a
+        fresh chat about a shopkeeper's TV set inherited a half-solved 200-metre
+        race from twenty-five minutes earlier and started reasoning about both.
+
+        Long-term MEMORY still spans sessions (that is what it is for); raw history
+        does not. That split is the point: a new conversation starts clean and can
+        still recall what it was told last week.
+        """
         history = self._events.recent(
             types=[EventType.USER_MESSAGE.value, EventType.ASSISTANT_MESSAGE.value],
-            limit=40,
+            limit=HISTORY_FETCH,
         )
         messages: list[ChatMessage] = []
         included: list[str] = []
         used = len(user_input)
+        # Measured back from the present, so a session resumed after a long break
+        # starts clean rather than continuing yesterday's train of thought.
+        newer_ts = now()
         for ev in reversed(history):  # newest-first selection under budget
+            if ev.payload.get("session_id") != session_id:
+                continue
+            if newer_ts - ev.ts > SITTING_GAP:
+                break
             text = str(ev.payload.get("text", ""))
             if used + len(text) > self._budget:
                 break
@@ -130,6 +159,7 @@ class ContextAssembler:
             messages.append(ChatMessage(role=role, text=text))
             included.append(ev.id)
             used += len(text)
+            newer_ts = ev.ts
         messages.reverse()
         included.reverse()
         messages.append(ChatMessage(role="user", text=user_input))
