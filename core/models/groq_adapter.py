@@ -91,6 +91,11 @@ class GroqAdapter:
     name = "groq"
     local = False  # cloud provider; never eligible to serve Tier-0 data
 
+    @property
+    def model(self) -> str:
+        """The model id actually being billed — read by the cost governor."""
+        return self._model
+
     def __init__(
         self,
         model: str,

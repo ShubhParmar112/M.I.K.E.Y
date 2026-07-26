@@ -85,6 +85,13 @@ class Config:
     context_budget_chars: int = field(
         default_factory=lambda: int(os.environ.get("MIKEY_CONTEXT_CHARS", "10000"))
     )
+    # Cost governor (Gen 3): USD of cloud inference allowed per calendar month.
+    # Once it's spent, the gateway serves from the local model instead of the cloud
+    # — spend stops, M.I.K.E.Y keeps working. Set MIKEY_MONTHLY_BUDGET_USD=0 to
+    # disable enforcement entirely (usage is still tracked, so `mikey spend` works).
+    monthly_budget_usd: float = field(
+        default_factory=lambda: float(os.environ.get("MIKEY_MONTHLY_BUDGET_USD", "10"))
+    )
     device_id: str = field(default_factory=lambda: os.environ.get("MIKEY_DEVICE", "dev_desktop_1"))
 
     @property

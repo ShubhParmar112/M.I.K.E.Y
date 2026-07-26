@@ -17,6 +17,7 @@ from core.executor_client import ExecResult, ExecutorClient
 from core.missions.store import MissionStore
 from core.orchestrator.loop import ApprovalRegistry, StreamEvent
 from core.policy.engine import ActionRequest, Decision, PolicyEngine
+from core.policy.preview import PREVIEWABLE, Preview, Previewer
 from core.events.schema import ulid
 
 
@@ -34,6 +35,10 @@ class MissionRunner:
         self._policy = policy
         self._executor = executor
         self._approvals = approvals
+        # A mission step gets the same simulate-first treatment as a chat action:
+        # unattended multi-step work is exactly where an unpreviewed overwrite
+        # would go unnoticed.
+        self._previewer = Previewer(executor)
 
     async def run(self, mission_id: str) -> AsyncIterator[StreamEvent]:
         state = self._missions.state(mission_id)
@@ -61,15 +66,28 @@ class MissionRunner:
             req = ActionRequest(
                 tool=step.tool, args=step.args, turn_id=mission_id, session_id=session_id
             )
-            decision = self._policy.evaluate(req).decision
+            verdict = self._policy.evaluate(req)
+            decision = verdict.decision
+
+            preview: Preview | None = None
+            if decision is not Decision.DENY and step.tool in PREVIEWABLE:
+                preview = await self._previewer.preview(step.tool, step.args)
+                if preview is not None and preview.destructive and verdict.via_session_grant:
+                    # A grant given at step 2 does not silently authorize a
+                    # destructive step 9.
+                    self._policy.record_preview_escalation(req, preview.summary)
+                    decision = Decision.ASK
+
             if decision is Decision.ASK:
                 approval_id = ulid()
                 fut = self._approvals.create(approval_id)
-                yield StreamEvent(
-                    "approval_request",
-                    {"approval_id": approval_id, "mission_id": mission_id, "step": i,
-                     "tool": step.tool, "args": step.args},
-                )
+                card = {
+                    "approval_id": approval_id, "mission_id": mission_id, "step": i,
+                    "tool": step.tool, "args": step.args,
+                }
+                if preview is not None:
+                    card["preview"] = preview.as_card()
+                yield StreamEvent("approval_request", card)
                 try:
                     approved, scope = await asyncio.wait_for(fut, timeout=600.0)
                 except TimeoutError:

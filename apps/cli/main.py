@@ -18,6 +18,7 @@ import httpx
 import typer
 import uvicorn
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
@@ -105,6 +106,33 @@ def _fallback_subtitle(ev: dict[str, Any], primary: str) -> str | None:
     return None
 
 
+def _preview_block(preview: dict[str, Any] | None) -> tuple[str, str]:
+    """Render an action's simulated effect for an approval card, plus the border
+    color the card should use. Gen 3's rule is that nothing destructive is approved
+    from its arguments alone — so when a preview says data will be lost, the card
+    says so loudly and shows the diff/dry-run underneath."""
+    if not preview:
+        return "", "yellow"
+    detail = str(preview.get("detail", "")).rstrip()
+    # ASCII only: a cp1252 console cannot encode U+26A0 and would raise mid-render,
+    # and an approval card is the last place that may fail to print.
+    if preview.get("destructive"):
+        head = "[bold red]DESTRUCTIVE[/bold red]"
+        if not preview.get("reversible"):
+            head += " [red](cannot be undone)[/red]"
+        color = "red"
+    else:
+        head = "[green]safe — nothing is overwritten[/green]"
+        color = "yellow"
+    if not preview.get("simulated"):
+        head += " [yellow](not simulated — effect unknown)[/yellow]"
+    block = f"\n{head}\n[bold]{preview.get('summary', '')}[/bold]"
+    if detail:
+        # escape() so a diff line starting with "[" is not eaten as rich markup
+        block += f"\n[dim]{escape(detail)}[/dim]"
+    return block, color
+
+
 def _handle_approval(client: httpx.Client, ev: dict[str, Any]) -> None:
     args = json.dumps(ev.get("args", {}), ensure_ascii=False)
     body = f"[bold]{ev['tool']}[/bold]\n{args}\n[dim]{ev.get('reason', '')}[/dim]"
@@ -112,10 +140,12 @@ def _handle_approval(client: httpx.Client, ev: dict[str, Any]) -> None:
     note = ev.get("critic_note")
     if note:
         color = "green" if ev.get("critic_sound") else "red"
-        label = "critic" if ev.get("critic_sound") else "CRITIC ⚠"
+        label = "critic" if ev.get("critic_sound") else "CRITIC!"  # ASCII: see _preview_block
         body += f"\n[{color}]{label}: {note}[/{color}]"
+    block, border = _preview_block(ev.get("preview"))
+    body += block
     console.print(
-        Panel(body, title="approval required", border_style="yellow")
+        Panel(body, title="approval required", border_style=border)
     )
     answer = console.input("[yellow]approve? \\[y]es / \\[n]o / \\[s]ession: [/yellow]").strip().lower()
     approved = answer in ("y", "yes", "s", "session")
@@ -583,6 +613,60 @@ def reasoning_eval_cmd(
     console.print(table)
 
 
+@app.command("spend")
+def spend_cmd() -> None:
+    """This month's model spend against the budget (Gen 3 cost governor)."""
+    from core.cost.governor import CostGovernor
+    from core.events.store import EventStore
+    from core.storage.db import Database
+
+    CONFIG.ensure_dirs()
+    db = Database(CONFIG.db_path)
+    try:
+        spend = CostGovernor(
+            EventStore(db), CONFIG.monthly_budget_usd, CONFIG.device_id
+        ).month_to_date()
+    finally:
+        db.close()
+
+    table = Table(show_header=True, header_style="bold", title=f"model spend · {spend.month}")
+    table.add_column("provider")
+    table.add_column("USD", justify="right")
+    for provider, cost in sorted(spend.by_provider.items(), key=lambda kv: -kv[1]):
+        label = f"{provider} [dim](local — free)[/dim]" if cost == 0 else provider
+        table.add_row(label, f"${cost:.4f}")
+    if not spend.by_provider:
+        table.add_row("[dim]no model calls yet this month[/dim]", "$0.0000")
+    console.print(table)
+
+    if not spend.enforced:
+        console.print(
+            f"[dim]{spend.calls} calls · ${spend.total_usd:.4f} · budget enforcement is off "
+            "(MIKEY_MONTHLY_BUDGET_USD=0) — tracking only[/dim]"
+        )
+    else:
+        pct = spend.fraction * 100
+        line = (
+            f"{spend.calls} calls · [bold]${spend.total_usd:.4f}[/bold] of "
+            f"${spend.budget_usd:.2f} ({pct:.0f}%)"
+        )
+        if spend.over_budget:
+            console.print(f"[red]{line} — budget spent[/red]")
+            console.print(
+                "[red]cloud calls are being refused; turns are served by the local model "
+                "until the month rolls over.[/red] Raise MIKEY_MONTHLY_BUDGET_USD to lift it."
+            )
+        elif spend.warning:
+            console.print(f"[yellow]{line} — ${spend.remaining_usd:.2f} left[/yellow]")
+        else:
+            console.print(f"[green]{line}[/green] · ${spend.remaining_usd:.2f} left")
+    if spend.estimated:
+        console.print(
+            "[dim]note: some calls used a model with no entry in the price table and were "
+            "charged at the conservative fallback rate — the real total is likely lower.[/dim]"
+        )
+
+
 @app.command("plan")
 def plan_cmd(
     goal: str = typer.Argument(..., help="the multi-step goal to plan"),
@@ -598,24 +682,27 @@ def plan_cmd(
     from core.storage.db import Database
 
     CONFIG.ensure_dirs()
-    result = asyncio.run(Planner(_make_gateway(CONFIG)).plan(goal))
-    if not result.ok:
-        console.print(f"[red]could not produce a plan:[/red] {result.notes}")
-        raise typer.Exit(1)
-
-    table = Table(show_header=True, header_style="bold", title=f"plan · {goal}")
-    table.add_column("#")
-    table.add_column("tool")
-    table.add_column("args")
-    for i, s in enumerate(result.steps):
-        table.add_row(str(i), s.tool, json.dumps(s.args, ensure_ascii=False)[:70])
-    console.print(table)
-    if result.rejected:
-        console.print(f"[yellow]dropped un-runnable steps:[/yellow] {', '.join(result.rejected)}")
-
     db = Database(CONFIG.db_path)
     try:
-        mission = MissionStore(EventStore(db), CONFIG.device_id).create(goal, result.steps)
+        events = EventStore(db)
+        # Billed to the same ledger as chat: planning is a real cloud call.
+        result = asyncio.run(Planner(_make_gateway(CONFIG, events=events)).plan(goal))
+        if not result.ok:
+            console.print(f"[red]could not produce a plan:[/red] {result.notes}")
+            raise typer.Exit(1)
+
+        table = Table(show_header=True, header_style="bold", title=f"plan · {goal}")
+        table.add_column("#")
+        table.add_column("tool")
+        table.add_column("args")
+        for i, s in enumerate(result.steps):
+            table.add_row(str(i), s.tool, json.dumps(s.args, ensure_ascii=False)[:70])
+        console.print(table)
+        if result.rejected:
+            console.print(
+                f"[yellow]dropped un-runnable steps:[/yellow] {', '.join(result.rejected)}"
+            )
+        mission = MissionStore(events, CONFIG.device_id).create(goal, result.steps)
     finally:
         db.close()
     console.print(f"[green]created mission[/green] {mission.id} · {len(result.steps)} steps")
@@ -691,12 +778,14 @@ def _render_mission_event(ev: StreamEvent, approvals: ApprovalRegistry) -> None:
         args = json.dumps(ev.data.get("args", {}), ensure_ascii=False)[:80]
         console.print(f"[dim]→ step {ev.data['step']}: {ev.data['tool']} {args}[/dim]")
     elif ev.kind == "approval_request":
+        block, border = _preview_block(ev.data.get("preview"))
         console.print(
             Panel(
                 f"[bold]{ev.data['tool']}[/bold]\n"
-                f"{json.dumps(ev.data.get('args', {}), ensure_ascii=False)}",
+                f"{json.dumps(ev.data.get('args', {}), ensure_ascii=False)}"
+                f"{block}",
                 title=f"approve step {ev.data['step']}?",
-                border_style="yellow",
+                border_style=border,
             )
         )
         ans = console.input("[yellow]approve? \\[y]es / \\[n]o / \\[s]ession: [/yellow]").strip().lower()
@@ -845,9 +934,12 @@ def consolidate(
     CONFIG.ensure_dirs()
     db = Database(CONFIG.db_path)
     try:
-        memory = MemoryStore(db, EventStore(db))
+        events = EventStore(db)
+        memory = MemoryStore(db, events)
         summary = asyncio.run(
-            Consolidator(_make_gateway(CONFIG)).consolidate_session(memory, session, force=force)
+            Consolidator(_make_gateway(CONFIG, events=events)).consolidate_session(
+                memory, session, force=force
+            )
         )
     finally:
         db.close()

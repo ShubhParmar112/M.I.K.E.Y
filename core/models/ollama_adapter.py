@@ -15,6 +15,10 @@ class OllamaAdapter:
     name = "ollama"
     local = True  # runs on-device; the Gateway may serve Tier-0 data here
 
+    @property
+    def model(self) -> str:
+        return self._model
+
     def __init__(
         self,
         base_url: str,

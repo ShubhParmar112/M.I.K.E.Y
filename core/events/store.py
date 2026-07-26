@@ -49,6 +49,25 @@ class EventStore:
             ).fetchall()
         return [self._row_to_event(r) for r in reversed(rows)]
 
+    def since(self, since_ts: str, types: list[str] | None = None) -> list[Event]:
+        """Every non-tombstoned event at or after an ISO timestamp, oldest-first.
+
+        Unlike `recent`, this is bounded by time rather than count — a month's
+        spend has to be summed in full, not sampled."""
+        not_dead = "id NOT IN (SELECT event_id FROM tombstones)"
+        if types:
+            marks = ",".join("?" * len(types))
+            rows = self._db.conn.execute(
+                f"SELECT * FROM events WHERE ts >= ? AND type IN ({marks}) AND {not_dead} "
+                "ORDER BY ts",
+                (since_ts, *types),
+            ).fetchall()
+        else:
+            rows = self._db.conn.execute(
+                f"SELECT * FROM events WHERE ts >= ? AND {not_dead} ORDER BY ts", (since_ts,)
+            ).fetchall()
+        return [self._row_to_event(r) for r in rows]
+
     @staticmethod
     def _row_to_event(row: object) -> Event:
         return Event.model_validate(

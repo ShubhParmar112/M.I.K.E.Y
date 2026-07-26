@@ -89,6 +89,22 @@ class ModelAdapter(Protocol):
     ) -> ModelResponse: ...
 
 
+class Governor(Protocol):
+    """The cost governor, as the gateway needs it (core.cost.governor.CostGovernor).
+    Declared structurally so the gateway keeps depending on nothing."""
+
+    def cloud_allowed(self) -> bool: ...
+
+    def record(
+        self,
+        provider: str,
+        model: str,
+        usage: dict[str, int],
+        capability: str = "general",
+        tier: Tier = Tier.T1,
+    ) -> float: ...
+
+
 def _is_local(adapter: ModelAdapter) -> bool:
     return bool(getattr(adapter, "local", False))
 
@@ -110,8 +126,12 @@ class ModelGateway:
         fallback: ModelAdapter | None = None,
         fallbacks: list[ModelAdapter] | None = None,
         routes: dict[str, ModelAdapter] | None = None,
+        governor: Governor | None = None,
     ) -> None:
         self._adapter = adapter
+        # Cost governor (Gen 3). Optional: without one the gateway behaves exactly
+        # as before, which is what tests and one-off tooling want.
+        self._governor = governor
         if fallbacks is not None:
             self._fallbacks = list(fallbacks)
         elif fallback is not None:
@@ -170,11 +190,37 @@ class ModelGateway:
                     "Ollama (or set MIKEY_PROVIDER=ollama) so private turns stay on-device."
                 )
 
+        # The monthly budget is enforced HERE, at the same single door as the
+        # privacy rule and for the same reason (Gen 3: "spend within budget
+        # automatically"). Once the budget is gone the cloud adapters drop out of
+        # the chain and the local model carries the load: the meter stops, the
+        # assistant does not. Only with no local model at all is this an error.
+        if self._governor is not None and not self._governor.cloud_allowed():
+            local_only = [a for a in candidates if _is_local(a)]
+            if not local_only:
+                raise RuntimeError(
+                    "this month's model budget is spent and no local model is "
+                    "configured to fall back on. Raise MIKEY_MONTHLY_BUDGET_USD, wait "
+                    "for the month to roll over, or install/start Ollama so M.I.K.E.Y "
+                    "keeps working for free. `mikey spend` shows where it went."
+                )
+            candidates = local_only
+
         errors: list[ModelUnavailable] = []
         for adapter in candidates:
             try:
                 resp = await adapter.complete(system, messages, tools)
                 self.last_provider = adapter.name
+                if self._governor is not None:
+                    # Bill the adapter that actually served, not the one asked —
+                    # a fallback to local is genuinely free and must read as free.
+                    self._governor.record(
+                        adapter.name,
+                        str(getattr(adapter, "model", "")),
+                        resp.usage,
+                        meta.capability if meta is not None else "general",
+                        meta.tier if meta is not None else Tier.T1,
+                    )
                 return resp
             except ModelUnavailable as exc:
                 errors.append(exc)  # this provider is down; try the next link

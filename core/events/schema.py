@@ -49,6 +49,7 @@ class EventType(StrEnum):
     MEMORY_EPISODE = "memory.episode"  # a summary of what happened in a session (episodic tier)
     MISSION_CREATED = "mission.created"  # a durable multi-step plan
     MISSION_STEP_RESULT = "mission.step.result"  # one step's outcome (durable progress)
+    MODEL_USAGE = "model.usage"  # one model call's tokens + cost (the spend ledger)
 
 
 class Provenance(BaseModel):

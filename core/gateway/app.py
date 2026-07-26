@@ -16,6 +16,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from core.config import CONFIG, Config
+from core.cost.governor import CostGovernor
 from core.events.store import EventStore
 from core.executor_client import ExecutorClient
 from core.ingest.files import FileIngestor
@@ -116,15 +117,28 @@ def _make_routes(config: Config) -> dict[str, ModelAdapter]:
     return routes
 
 
-def _make_gateway(config: Config, adapter: ModelAdapter | None = None) -> ModelGateway:
+def _make_governor(config: Config, events: EventStore) -> CostGovernor:
+    """The monthly budget, backed by the event log as its ledger (Gen 3)."""
+    return CostGovernor(events, config.monthly_budget_usd, config.device_id)
+
+
+def _make_gateway(
+    config: Config,
+    adapter: ModelAdapter | None = None,
+    events: EventStore | None = None,
+) -> ModelGateway:
     """The one place a real gateway is assembled — used by the server and the CLI
-    planner alike, so both honor the same primary/fallback chain and S2 routes."""
+    planner alike, so both honor the same primary/fallback chain, S2 routes, and
+    monthly budget. Pass `events` so the calls are billed to the shared ledger;
+    without it the gateway runs ungoverned (tests, one-off tooling)."""
+    governor = _make_governor(config, events) if events is not None else None
     if adapter is not None:
-        return ModelGateway(adapter)
+        return ModelGateway(adapter, governor=governor)
     return ModelGateway(
         _make_adapter(config),
         fallbacks=_make_fallbacks(config),
         routes=_make_routes(config),
+        governor=governor,
     )
 
 
@@ -169,7 +183,7 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
     # A caller-supplied adapter (tests) runs solo; the real server gets the
     # cloud→local hybrid + any per-brain S2 routes so a rate limit or dropped
     # connection isn't fatal and localized brains are served locally.
-    gateway = _make_gateway(config, adapter)
+    gateway = _make_gateway(config, adapter, events)
     orch = Orchestrator(
         config, memory, traces, policy, gateway, executor, approvals, critic=Critic(gateway)
     )
@@ -244,6 +258,7 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
 
     @app.get("/v1/health")
     async def health() -> dict[str, Any]:
+        spend = _make_governor(config, events).month_to_date()
         return {
             "ok": True,
             "provider": gateway.provider,
@@ -252,6 +267,13 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
             "routed_capabilities": gateway.routed_capabilities,
             "build": build,
             "audit_chain_valid": policy.verify_audit_chain(),
+            "spend": {
+                "month": spend.month,
+                "total_usd": round(spend.total_usd, 4),
+                "budget_usd": spend.budget_usd,
+                "over_budget": spend.over_budget,
+                "warning": spend.warning,
+            },
         }
 
     @app.on_event("shutdown")

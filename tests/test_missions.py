@@ -73,24 +73,27 @@ async def _drive(runner: MissionRunner, mission_id: str, stop_after: int | None 
 
 
 async def test_mission_survives_reboot_and_completes(env) -> None:
+    """The Gen 3 exit criterion, exactly as written: a 10+ step mission survives a
+    mid-mission reboot and completes — every step run once, nothing repeated."""
     config, db = env
     missions = MissionStore(EventStore(db))
     policy = PolicyEngine(db)
     approvals = ApprovalRegistry()
     executor = ExecutorClient(config.workspace)
-    mission = missions.create("write six files", _write_steps(6))
+    steps = 10
+    mission = missions.create("write ten files", _write_steps(steps))
 
     try:
         runner = MissionRunner(config, missions, policy, executor, approvals)
-        await _drive(runner, mission.id, stop_after=3, approvals=approvals)  # crash after 3
-        # exactly three side effects so far
-        assert (config.workspace / "out" / "f2.txt").exists()
-        assert not (config.workspace / "out" / "f3.txt").exists()
+        await _drive(runner, mission.id, stop_after=6, approvals=approvals)  # crash after 6
+        # exactly six side effects so far
+        assert (config.workspace / "out" / "f5.txt").exists()
+        assert not (config.workspace / "out" / "f6.txt").exists()
 
         # --- reboot: brand-new store + runner, state comes only from the log ---
         missions2 = MissionStore(EventStore(db))
         resumed: MissionState = missions2.state(mission.id)
-        assert resumed.next_step == 3 and resumed.status == "running"
+        assert resumed.next_step == 6 and resumed.status == "running"
 
         runner2 = MissionRunner(config, missions2, policy, executor, approvals)
         await _drive(runner2, mission.id, approvals=approvals)  # resume to the end
@@ -98,7 +101,36 @@ async def test_mission_survives_reboot_and_completes(env) -> None:
         await executor.close()
 
     # every step ran exactly once, mission complete
-    for i in range(6):
+    for i in range(steps):
         assert (config.workspace / "out" / f"f{i}.txt").read_text() == f"step{i}"
     assert missions2.state(mission.id).status == "completed"
     assert policy.verify_audit_chain() is True
+
+
+async def test_a_mission_step_that_clobbers_a_file_is_previewed_before_approval(env) -> None:
+    """Unattended multi-step work is where an unpreviewed overwrite would slip
+    through unnoticed, so mission steps get the same simulate-first treatment."""
+    config, db = env
+    (config.workspace / "out").mkdir(parents=True, exist_ok=True)
+    (config.workspace / "out" / "f0.txt").write_text("PRECIOUS", encoding="utf-8")
+
+    missions = MissionStore(EventStore(db))
+    approvals = ApprovalRegistry()
+    executor = ExecutorClient(config.workspace)
+    mission = missions.create("overwrite a file", _write_steps(1))
+    runner = MissionRunner(config, missions, PolicyEngine(db), executor, approvals)
+
+    previews: list[dict] = []
+    try:
+        async for ev in runner.run(mission.id):
+            if ev.kind == "approval_request":
+                previews.append(ev.data["preview"])
+                approvals.resolve(ev.data["approval_id"], approved=False, scope="once")
+    finally:
+        await executor.close()
+
+    assert len(previews) == 1
+    assert previews[0]["destructive"] is True
+    assert "-PRECIOUS" in previews[0]["detail"]  # the user sees what would be lost
+    # denied, so the file is untouched
+    assert (config.workspace / "out" / "f0.txt").read_text(encoding="utf-8") == "PRECIOUS"

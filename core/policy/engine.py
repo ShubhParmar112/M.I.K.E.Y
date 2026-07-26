@@ -36,6 +36,11 @@ class ActionRequest:
 class PolicyResult:
     decision: Decision
     reason: str
+    # True when the ALLOW came from a standing session grant rather than the rule
+    # table. The caller re-checks these against the action's simulated preview: a
+    # grant for "write files this session" must not silently cover an overwrite
+    # that destroys existing content (Gen 3: no destructive action without preview).
+    via_session_grant: bool = False
 
 
 # Gen 1 rule table: action class -> decision. Reads observe, writes ask.
@@ -83,7 +88,7 @@ class PolicyEngine:
         elif base is Decision.ASK and self._signature(req) in self._session_grants.get(
             req.session_id, set()
         ):
-            result = PolicyResult(Decision.ALLOW, "standing session grant")
+            result = PolicyResult(Decision.ALLOW, "standing session grant", via_session_grant=True)
         else:
             result = PolicyResult(base, f"rule for '{req.tool}'")
         self._audit("policy", req, result.decision.value, result.reason)
@@ -92,6 +97,12 @@ class PolicyEngine:
     def grant_session(self, req: ActionRequest) -> None:
         self._session_grants.setdefault(req.session_id, set()).add(self._signature(req))
         self._audit("user", req, "session_grant", "user granted for session")
+
+    def record_preview_escalation(self, req: ActionRequest, why: str) -> None:
+        """A session grant was withdrawn because the action's preview showed it
+        destroys data. Audited, so the escalation is as reconstructable as the
+        grant that it overrode."""
+        self._audit("policy", req, "ask", f"session grant does not cover a destructive action: {why}")
 
     def record_auto_denial(self, req: ActionRequest) -> None:
         self._audit("policy", req, "deny", "auto-denied: repeat of user-denied action")

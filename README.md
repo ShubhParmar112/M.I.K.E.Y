@@ -24,7 +24,7 @@ This repository contains a working **Gen 1–3 core** — append-only event log,
 
 ```powershell
 uv sync                      # install
-uv run pytest                # verify (231 passing)
+uv run pytest                # verify (262 passing)
 
 # pick a model provider (any of the three):
 $env:GROQ_API_KEY = "gsk_..."               # cloud (Groq, free tier, Llama 3.3), or:
@@ -86,6 +86,48 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 |---|---|
 | `mikey backup` | Verified snapshot of the whole store (log + audit chain). |
 | `mikey restore <path> [--yes]` | Restore from a backup (verifies it, snapshots current state first). |
+| `mikey spend` | This month's model spend per provider against the budget, and what happens when it runs out. |
+
+## Simulate first, then ask
+
+Nothing that can destroy data is approved from its arguments alone. Before a
+destructive action reaches an approval card, M.I.K.E.Y works out what it would
+actually do and shows you that:
+
+| Action | What the card shows |
+|---|---|
+| `fs_write` over an existing file | the unified diff — the lines that disappear, not just "a write happens" |
+| `git clean`, `git rm` | the real `--dry-run`, so you see the file list before anything is deleted |
+| `git reset --hard`, `git checkout --` | the uncommitted work that would be discarded |
+| `memory_forget` | the text of the memory being deleted, with its source and date |
+
+A write that turns out to *create* a file is marked safe and stays frictionless.
+The invariant is enforced, not merely offered: a standing "approve for this
+session" grant covers routine writes but is **withdrawn** the moment a preview
+shows data would be lost — and that withdrawal is written to the audit chain, so
+it is as reconstructable as the grant it overrode. A preview that fails still
+produces a card, flagged unsimulated; silence is the one outcome that is not
+allowed. Mission steps get the same treatment — unattended work is exactly where
+an unpreviewed overwrite would go unnoticed.
+
+## The cost governor
+
+Model spend is a projection over the event log: every call appends a
+`model.usage` event with its tokens and cost, so the month-to-date total survives
+a restart, a rebuilt index, and a restore-from-backup. The budget is enforced at
+the model gateway — the same single door as the Tier-0 privacy rule — and when
+it runs out, **cloud adapters drop out of the chain and the local model keeps
+serving**: the meter stops, the assistant doesn't. Only with no local model at
+all does it become an error.
+
+```powershell
+$env:MIKEY_MONTHLY_BUDGET_USD = "10"   # default; "0" disables enforcement (tracking continues)
+```
+
+Prices are a dated, approximate table (`core/cost/governor.py`) — a model that
+isn't in it is charged at a deliberately high fallback rate rather than zero,
+because an unpriced model reading as free is how a budget silently stops binding.
+`mikey spend` says when a month's total was estimated that way.
 
 ## Brains & local-first routing
 
@@ -125,6 +167,8 @@ Useful env knobs: `MIKEY_LOCAL_BRAINS` (brains to run locally), `MIKEY_OLLAMA_MO
 | Executor sandbox (separate process, path confinement, command allowlist) | ✅ `executor/` |
 | Turn loop + brain fleet (router · conversation · reasoning · operator · memory · critic · planner) | ✅ `core/orchestrator/` |
 | Durable missions (multi-step, policy-gated, resume after reboot) | ✅ `core/missions/` |
+| Simulate-first previews for destructive actions (diff / dry-run / memory text) | ✅ `core/policy/preview.py` |
+| Cost governor (spend ledger in the log, monthly budget enforced at the gateway) | ✅ `core/cost/` |
 | Memory: hybrid FTS + vector retrieval, ingestion, verified forgetting, taint | ✅ `core/memory/`, `core/ingest/` |
 | Session gateway API (SSE streaming, approvals, traces) | ✅ `core/gateway/` |
 | CLI with approval cards, trace viewer, doctor, planner | ✅ `apps/cli/` |

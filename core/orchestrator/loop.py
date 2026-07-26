@@ -25,6 +25,7 @@ from core.orchestrator.brains import Router
 from core.orchestrator.critic import Critic
 from core.orchestrator.tiering import classify_tier
 from core.policy.engine import ActionRequest, Decision, PolicyEngine
+from core.policy.preview import PREVIEWABLE, Preview, Previewer
 from core.trace.store import TraceStore
 
 MAX_STEPS = 12  # hard stop against runaway loops (review M8's tiny Gen 1 cousin)
@@ -90,6 +91,10 @@ class Orchestrator:
         # Optional second-opinion pass on risky actions. Injected so tests and
         # lightweight callers opt in; the real gateway app always wires one.
         self._critic = critic
+        # Simulate-first (Gen 3): builds the "here is what this will actually do"
+        # preview shown on every destructive approval card. Uses the same confined
+        # executor as the real action, so previewing can't reach further than doing.
+        self._previewer = Previewer(executor, memory)
         self._assembler = ContextAssembler(
             memory.events, memory, config.context_budget_chars
         )
@@ -296,6 +301,29 @@ class Orchestrator:
                 )
 
                 decision = verdict.decision
+
+                # Simulate first (Gen 3): before anything that could destroy data
+                # is approved, work out what it would actually do — the diff, the
+                # files a dry-run would delete, the memory text behind an id.
+                preview: Preview | None = None
+                if decision is not Decision.DENY and tc.name in PREVIEWABLE:
+                    preview = await self._previewer.preview(tc.name, tc.arguments)
+                    if preview is not None:
+                        self._traces.span(
+                            turn_id,
+                            "preview",
+                            {"tool": tc.name, "destructive": preview.destructive,
+                             "simulated": preview.simulated, "summary": preview.summary,
+                             "detail": preview.detail[:2000]},
+                            parent_id=span,
+                        )
+                        # "Approve writes for this session" is consent to routine
+                        # work, not to clobbering a file the user has not seen the
+                        # diff for. A destructive action always comes back to them.
+                        if preview.destructive and verdict.via_session_grant:
+                            self._policy.record_preview_escalation(req, preview.summary)
+                            decision = Decision.ASK
+
                 if decision is Decision.ASK:
                     approval_id = ulid()
                     fut = self._approvals.create(approval_id)
@@ -305,6 +333,8 @@ class Orchestrator:
                         "args": tc.arguments,
                         "reason": verdict.reason,
                     }
+                    if preview is not None:
+                        card["preview"] = preview.as_card()
                     # An independent brain reviews the action before the card is
                     # shown, so a mismatch / overreach / injection-driven action is
                     # flagged rather than rubber-stamped. Advisory: the user decides.

@@ -282,6 +282,29 @@ class MemoryStore:
     DUP_THRESHOLD = 0.85  # at/above this overlap, it's the same fact — don't dupe
     RELATED_THRESHOLD = 0.4  # in [RELATED, DUP): possibly conflicting — flag it
 
+    def note(self, event_id: str) -> MemoryHit | None:
+        """The live memory behind an id, or None if it never existed or is already
+        tombstoned. Used to show the user what a `memory_forget` would actually
+        delete — an approval card holding a bare ULID is not something anyone can
+        consent to."""
+        row = self._db.conn.execute(
+            "SELECT event_id, source, trusted, ts, text FROM memory_fts "
+            "WHERE event_id = ? AND event_id NOT IN (SELECT event_id FROM tombstones)",
+            (event_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        hit = MemoryHit(
+            event_id=row["event_id"],
+            source=row["source"],
+            trusted=bool(row["trusted"]),
+            ts=row["ts"],
+            text=row["text"],
+            rank=0.0,
+        )
+        self._label_tiers([hit])
+        return hit
+
     def recent_notes(self, limit: int = 500) -> list[Event]:
         """Durable memory notes only (excludes tombstoned — EventStore.recent does)."""
         return self._events.recent(types=[EventType.MEMORY_NOTE.value], limit=limit)
