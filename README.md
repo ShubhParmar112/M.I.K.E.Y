@@ -65,6 +65,8 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 | `mikey serve` | Run the gateway in the foreground (for a separate terminal). |
 | `mikey trace [turn_id]` | "Why did you do that?" — the full reasoning tree for a turn (route → model call → policy → tool). Defaults to the last turn. |
 | `mikey events [--limit N]` | Recent raw events from the append-only log. |
+| `mikey brief [--hours N] [--speak]` | What happened and anything worth knowing — composed from the log, so it costs no quota and can't invent anything. |
+| `mikey nudges [--dismiss <id\|kind>]` | What M.I.K.E.Y is waiting to tell you, and what it has stopped mentioning. Dismissing a kind enough times mutes it for good. |
 
 **Memory**
 
@@ -100,6 +102,36 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 | `mikey restore <path> [--yes]` | Restore from a backup (verifies it, snapshots current state first). |
 | `mikey spend` | This month's model spend per provider against the budget, and today's usage against each free-tier **daily** allowance — the limit that actually runs out and silently drops answers onto the weak local model. Providers are gauged by whichever allowance binds first (Groq counts tokens/day, Gemini counts requests/day). |
 | `mikey providers` | The whole answer chain: who is primary, who backs it up, which keys are missing, and what each free tier is worth. Tells you if you are one exhausted quota away from the 3B model. |
+
+## Speaking first
+
+The gateway is the only thing always running, so it is the only thing that can
+notice something while nobody is watching. Every few minutes it looks at the log
+— no model call, so this costs nothing and cannot hallucinate — and records a
+**nudge** when it finds one of a small set of things whose first symptom is
+otherwise "why has it got worse?": a daily allowance about to run out, answers
+already coming from the local model, a mission that stopped moving, a spent
+budget, a broken audit chain.
+
+A nudge is an event, so what is outstanding is a projection like everything else:
+it survives a restart, and "why did you tell me that?" has an answer in the log.
+
+The interesting part is the restraint (`core/proactive/discipline.py`), because a
+system that says true things at wrong moments gets muted — and a muted assistant
+is worse than a silent one, since you have also stopped trusting it:
+
+- **Never mid-turn.** Nothing is volunteered while you're waiting on an answer.
+- **Quiet hours** (22:00–08:00) hold everything except the genuinely urgent.
+- **A ceiling** of three volunteered remarks per session and four per hour; past
+  it the rest waits, most pressing first rather than most recent.
+- **Dismissing means something.** A dismissed nudge stays gone for a day rather
+  than returning on the next tick, and a kind you wave away three times stops
+  being raised at all — no setting to find, you just keep saying no.
+- **Stale notes are dropped, not shown late.** "About four calls left today" is
+  useful for an hour and misleading tomorrow.
+
+Set `MIKEY_PROACTIVE=0` to keep it strictly reactive, or
+`MIKEY_PROACTIVE_INTERVAL` to change how often it looks (default 300s).
 
 ## Voice
 

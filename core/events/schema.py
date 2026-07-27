@@ -50,6 +50,8 @@ class EventType(StrEnum):
     MISSION_CREATED = "mission.created"  # a durable multi-step plan
     MISSION_STEP_RESULT = "mission.step.result"  # one step's outcome (durable progress)
     MODEL_USAGE = "model.usage"  # one model call's tokens + cost (the spend ledger)
+    NUDGE_RAISED = "proactive.nudge.raised"  # something M.I.K.E.Y wants to say first
+    NUDGE_DELIVERED = "proactive.nudge.delivered"  # ...and when it got said, or was dropped
 
 
 class Provenance(BaseModel):

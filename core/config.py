@@ -134,6 +134,17 @@ class Config:
     daily_token_cap: int = field(
         default_factory=lambda: int(os.environ.get("MIKEY_DAILY_TOKEN_CAP", "0"))
     )
+    # --- proactivity (Gen 4) ---
+    # Whether M.I.K.E.Y may notice things and say them without being asked. The
+    # watching itself costs no model call — it reads the log — so the interval is
+    # set by how stale a warning may be, not by expense. MIKEY_PROACTIVE=0 to keep
+    # it strictly reactive.
+    proactive: bool = field(
+        default_factory=lambda: os.environ.get("MIKEY_PROACTIVE", "1") != "0"
+    )
+    proactive_interval_s: int = field(
+        default_factory=lambda: int(os.environ.get("MIKEY_PROACTIVE_INTERVAL", "300"))
+    )
     # --- voice (optional: `uv sync --extra voice`) ---
     # Which voice speaks. "local" = Windows' own speech: offline, private, robotic.
     # "edge" = Microsoft's neural voices: sounds human, but sends the text of every

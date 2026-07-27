@@ -22,9 +22,12 @@ from core.ingest.files import FileIngestor
 from core.memory.store import MemoryStore
 from core.models.fake_adapter import FakeAdapter
 from core.models.gateway import ModelAdapter, ModelGateway
+from core.missions.store import MissionStore
 from core.orchestrator.critic import Critic
 from core.orchestrator.loop import ApprovalRegistry, Orchestrator, stream_event_json
 from core.policy.engine import PolicyEngine
+from core.proactive.nudge import NudgeStore
+from core.proactive.watch import Sentinel
 from core.storage.db import Database
 from core.trace.store import TraceStore
 
@@ -182,6 +185,17 @@ class ApprovalDecision(BaseModel):
     scope: str = "once"  # "once" | "session"
 
 
+class NudgeDecision(BaseModel):
+    # Module level, like the model above and unlike the request bodies declared
+    # inside create_app: this file uses `from __future__ import annotations`, so a
+    # handler's annotations are strings resolved against module globals. A model
+    # defined in a local scope is invisible there, and FastAPI silently falls back
+    # to reading the parameter off the query string — which is how the first live
+    # POST to this endpoint failed with "field required".
+    outcome: str = "shown"  # "shown" | "dismissed"
+    how: str = "chat"
+
+
 def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> FastAPI:
     config.ensure_dirs()
     db = Database(config.db_path)
@@ -203,6 +217,14 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
     gateway = _make_gateway(config, adapter, events)
     orch = Orchestrator(
         config, memory, traces, policy, gateway, executor, approvals, critic=Critic(gateway)
+    )
+
+    # Proactivity (Gen 4): the gateway is the only thing that is always running, so
+    # it is the only thing that can notice something while nobody is watching.
+    nudges = NudgeStore(events, config.device_id)
+    missions = MissionStore(events, config.device_id)
+    sentinel = Sentinel(
+        config, events, nudges, _make_governor(config, events), missions, policy
     )
 
     app = FastAPI(title="M.I.K.E.Y Gateway", version="0.1.0")
@@ -320,8 +342,81 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
             },
         }
 
+    @app.get("/v1/nudges")
+    async def list_nudges() -> dict[str, Any]:
+        """What M.I.K.E.Y would say unprompted, and why it hasn't yet.
+
+        Reading this does NOT deliver them: a surface decides whether anyone is
+        actually there, and confirms with the POST below. Otherwise a health check
+        would silently consume the thing you were meant to be told."""
+        pending = nudges.pending()
+        return {
+            # So the surface can stop raising a kind the person keeps waving away.
+            "dismissals": nudges.dismissals_by_kind(),
+            "nudges": [
+                {
+                    "id": n.id,
+                    "kind": n.kind,
+                    "text": n.text,
+                    "detail": n.detail,
+                    "urgency": n.urgency,
+                    "created": n.created.isoformat(),
+                }
+                for n in pending
+            ]
+        }
+
+    @app.post("/v1/nudges/{nudge_id}")
+    async def close_nudge(nudge_id: str, decision: NudgeDecision) -> dict[str, bool]:
+        nudges.deliver(nudge_id, how=decision.how, outcome=decision.outcome)
+        return {"ok": True}
+
+    @app.get("/v1/brief")
+    async def get_brief(hours: int = 24) -> dict[str, Any]:
+        from datetime import timedelta
+
+        from core.events.schema import now as _now
+        from core.proactive.brief import compose
+
+        sentinel.tick()  # look before briefing, so it reflects this moment
+        at = _now()
+        brief = compose(
+            events,
+            nudges.pending(),
+            missions_open=len(missions.active()),
+            since=at - timedelta(hours=max(1, hours)),
+            at=at,
+        )
+        return {
+            "since": brief.since.isoformat(),
+            "quiet": brief.quiet,
+            "lines": brief.lines(),
+            "spoken": brief.spoken(),
+            "nudges": [{"id": n.id, "kind": n.kind, "urgency": n.urgency} for n in brief.nudges],
+        }
+
+    @app.on_event("startup")
+    async def start_sentinel() -> None:
+        import asyncio
+
+        async def watch_loop() -> None:
+            # Looking is cheap (a few indexed reads) and costs no model call, so the
+            # interval is set by how stale a warning may be, not by expense.
+            while True:
+                try:
+                    await asyncio.to_thread(sentinel.tick)
+                except Exception:  # noqa: BLE001 — a watchdog must not take the gateway down
+                    pass
+                await asyncio.sleep(config.proactive_interval_s)
+
+        if config.proactive:
+            app.state.sentinel_task = asyncio.create_task(watch_loop())
+
     @app.on_event("shutdown")
     async def shutdown() -> None:
+        task = getattr(app.state, "sentinel_task", None)
+        if task is not None:
+            task.cancel()
         await executor.close()
 
     return app

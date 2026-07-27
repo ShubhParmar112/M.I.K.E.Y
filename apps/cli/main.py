@@ -206,6 +206,98 @@ def _chain_providers(health: dict[str, Any]) -> list[str]:
     return [c for c in chain if c]
 
 
+_URGENCY_COLOR = {"high": "red", "normal": "yellow", "low": "dim"}
+
+
+class _Sitting:
+    """How much this session has already been interrupted.
+
+    Lives in the surface rather than the gateway because only the surface knows
+    whether anyone is actually sitting here — the same queue shown to a person who
+    just opened a session and to one who has been talking for an hour deserves
+    different restraint.
+    """
+
+    def __init__(self) -> None:
+        self.said = 0
+        self.delivered_at: list[Any] = []
+
+
+def _collect_nudges(
+    sitting: _Sitting, mouth: Any | None = None, how: str = "chat"
+) -> list[dict[str, Any]]:
+    """Say anything M.I.K.E.Y noticed while nobody was looking — as much of it as
+    is warranted right now — and mark what was said.
+
+    Reading the queue does not close it; this does, and only after actually putting
+    something in front of someone. A nudge consumed by a health check is a nudge
+    that was never delivered. What the budget holds back stays pending for later.
+    """
+    from core.proactive.discipline import Attention, choose
+    from core.proactive.nudge import Nudge
+
+    try:
+        body = httpx.get(f"{BASE}/v1/nudges", timeout=5.0).json()
+    except (httpx.HTTPError, ValueError):
+        return []
+    pending = body.get("nudges", [])
+    if not pending:
+        return []
+
+    from datetime import datetime
+
+    by_id = {n["id"]: n for n in pending}
+    candidates = [
+        Nudge(
+            id=n["id"],
+            kind=n.get("kind", ""),
+            text=n.get("text", ""),
+            detail=n.get("detail", ""),
+            urgency=n.get("urgency", "normal"),
+            created=datetime.fromisoformat(n["created"]),
+        )
+        for n in pending
+    ]
+    now_local = datetime.now().astimezone()
+    speak, held = choose(
+        candidates,
+        Attention(
+            at=now_local,
+            said_this_session=sitting.said,
+            recent_deliveries=list(sitting.delivered_at),
+            dismissals_by_kind=body.get("dismissals", {}),
+        ),
+    )
+
+    for nudge in speak:
+        raw = by_id[nudge.id]
+        color = _URGENCY_COLOR.get(nudge.urgency, "yellow")
+        console.print(f"[{color}]· {nudge.text}[/{color}]")
+        if raw.get("detail"):
+            console.print(f"  [dim]{raw['detail']}[/dim]")
+        sitting.said += 1
+        sitting.delivered_at.append(now_local)
+        try:
+            httpx.post(
+                f"{BASE}/v1/nudges/{nudge.id}",
+                json={"outcome": "shown", "how": how},
+                timeout=5.0,
+            )
+        except httpx.HTTPError:
+            pass
+
+    if held:
+        console.print(f"[dim]({len(held)} more held back — {held[0][1]})[/dim]")
+
+    if mouth is not None:
+        # Spoken: the urgent ones only. Hearing three notes read out before you have
+        # said anything is the behaviour that gets a voice assistant muted.
+        urgent = [n.text for n in speak if n.urgency == "high"]
+        if urgent:
+            _speak(mouth, " ".join(urgent))
+    return [by_id[n.id] for n in speak]
+
+
 def _handle_approval(
     client: httpx.Client, ev: dict[str, Any], mouth: Any | None = None
 ) -> None:
@@ -313,6 +405,8 @@ def chat(
             title="M.I.K.E.Y",
         )
     )
+    sitting = _Sitting()
+    _collect_nudges(sitting)
     last_turn: str | None = None
     with httpx.Client(timeout=None) as client:
         while True:
@@ -341,6 +435,9 @@ def chat(
                 continue
 
             last_turn = _run_turn(client, session, user_input, primary) or last_turn
+            # Between turns, never during one: anything noticed while that ran can
+            # be mentioned now that the person has what they asked for.
+            _collect_nudges(sitting)
 
 
 def _run_turn(
@@ -503,10 +600,15 @@ def voice(
     quota = _quota_line(health)
     if quota:
         console.print(quota)
+    sitting = _Sitting()
+    _collect_nudges(sitting, mouth, how="voice")
 
     with httpx.Client(timeout=None) as client:
         while True:
             try:
+                # Checked between turns, so M.I.K.E.Y can speak first — but never
+                # over the answer to something that was actually asked for.
+                _collect_nudges(sitting, mouth, how="voice")
                 console.print("[bold cyan]listening…[/bold cyan]")
                 heard = ears.listen()
             except MicrophoneUnavailable as exc:
@@ -1024,6 +1126,88 @@ PROVIDER_HELP: dict[str, tuple[str, str]] = {
         "free — metered in requests/day, so long documents cost nothing extra",
     ),
 }
+
+
+@app.command("brief")
+def brief_cmd(
+    hours: int = typer.Option(24, help="how far back to summarise"),
+    speak: bool = typer.Option(False, "--speak", help="read it out"),
+) -> None:
+    """What happened, and anything worth knowing — composed from the log, not a model.
+
+    No model call means it costs no quota and cannot invent anything, which matters
+    most for the one thing nobody asked for.
+    """
+    _ensure_server()
+    try:
+        data = httpx.get(f"{BASE}/v1/brief", params={"hours": hours}, timeout=30.0).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        console.print(f"[red]could not reach the gateway:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    lines = data.get("lines", [])
+    console.print(
+        Panel(
+            "\n".join(f"· {line}" for line in lines) or "· Nothing outstanding.",
+            title="brief",
+            border_style="cyan" if not data.get("quiet") else "dim",
+        )
+    )
+    if speak:
+        from core.voice.mouth import Mouth
+        from core.voice.synth import make_synth
+
+        tiered = make_synth(CONFIG.voice_synth, CONFIG.voice_name)
+        if tiered is None:
+            console.print("[dim]voice is off (MIKEY_VOICE=off)[/dim]")
+        else:
+            _speak(Mouth(tiered), data.get("spoken", ""))
+
+
+@app.command("nudges")
+def nudges_cmd(
+    dismiss: str = typer.Option("", help="dismiss one by id, or a kind (e.g. quota)"),
+) -> None:
+    """What M.I.K.E.Y is waiting to tell you, and what it has stopped mentioning.
+
+    Dismissing is how you turn something off: a kind waved away enough times stops
+    being raised at all, without anyone having to find a setting.
+    """
+    _ensure_server()
+    body = httpx.get(f"{BASE}/v1/nudges", timeout=5.0).json()
+    pending = body.get("nudges", [])
+
+    if dismiss:
+        targets = [n for n in pending if n["id"] == dismiss or n.get("kind") == dismiss]
+        if not targets:
+            console.print(f"[yellow]nothing pending matches '{dismiss}'[/yellow]")
+            raise typer.Exit(1)
+        for n in targets:
+            httpx.post(
+                f"{BASE}/v1/nudges/{n['id']}",
+                json={"outcome": "dismissed", "how": "cli"},
+                timeout=5.0,
+            )
+        console.print(f"[green]dismissed {len(targets)}[/green]")
+        return
+
+    if not pending:
+        console.print("[dim]nothing pending[/dim]")
+    else:
+        table = Table(show_header=True, header_style="bold", title="pending")
+        table.add_column("urgency")
+        table.add_column("kind")
+        table.add_column("what")
+        for n in pending:
+            color = _URGENCY_COLOR.get(n.get("urgency", "normal"), "yellow")
+            table.add_row(f"[{color}]{n.get('urgency')}[/{color}]", n.get("kind", ""), n["text"])
+        console.print(table)
+
+    muted = {k: c for k, c in (body.get("dismissals") or {}).items() if c >= 3}
+    if muted:
+        console.print(
+            "[dim]muted (dismissed 3+ times): " + ", ".join(sorted(muted)) + "[/dim]"
+        )
 
 
 @app.command("providers")
