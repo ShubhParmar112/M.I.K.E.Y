@@ -341,3 +341,5 @@ Useful env knobs: `MIKEY_LOCAL_BRAINS` (brains to run locally), `MIKEY_OLLAMA_MO
 - **The event log is the source of truth.** Memory, knowledge graph, and sync state are all derived, rebuildable indexes.
 - **Measured self-improvement only.** No "reflection" without an evaluation harness; a system that cannot measure itself cannot improve itself.
 - **Modular monolith first, services later.** Process boundaries where safety demands them (execution sandbox), not where fashion suggests them.
+
+<!-- This is a comment only for one single github streak -->
