@@ -9,6 +9,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+# One response is one JSON line, and asyncio's default StreamReader buffer is
+# 64 KiB — so every reply bigger than that failed with "Separator is not found,
+# and chunk exceed the limit" and, worse, left the rest of the line in the pipe
+# for the NEXT call to read as its own response. The executor deliberately allows
+# a 1 MB file read and a 100 KB fetch, so most of that range was unreachable:
+# reading a large file or fetching a real web page returned a cryptic executor
+# failure. The buffer must comfortably exceed the executor's own limits, with
+# room for JSON escaping expanding the payload.
+EXECUTOR_STREAM_LIMIT = 8 * 1024 * 1024
+
+
 @dataclass
 class ExecResult:
     ok: bool
@@ -35,6 +46,7 @@ class ExecutorClient:
                 str(self._workspace),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
+                limit=EXECUTOR_STREAM_LIMIT,
             )
         return self._proc
 
@@ -59,6 +71,19 @@ class ExecutorClient:
                 await self._kill()
                 return ExecResult(
                     False, "executor timed out and was restarted; the action did not complete",
+                    False,
+                )
+            except ValueError:
+                # A response longer than the buffer above. readline() gives up with
+                # the remainder of the line still in the pipe, which the next call
+                # would read as ITS response — so this connection is unusable and
+                # the executor is replaced rather than reused. Same rule as the
+                # timeout: never continue on a stream that may be out of step.
+                await self._kill()
+                return ExecResult(
+                    False,
+                    "the result was too large to return from the sandbox; ask for a "
+                    "smaller slice (a specific file, or a filtered command)",
                     False,
                 )
             if not line:

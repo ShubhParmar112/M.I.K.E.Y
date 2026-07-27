@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from core.cost.governor import CostGovernor, price_for
+from core.cost.governor import CostGovernor, daily_cap_for, price_for
 from core.events.schema import EventType, Tier
 from core.events.store import EventStore
 from core.models.gateway import (
@@ -188,3 +188,73 @@ def test_warning_fires_before_the_budget_is_gone(events: EventStore) -> None:
     gov.record("groq", "llama-3.3-70b-versatile", {"input_tokens": 1_500_000, "output_tokens": 0})
     spend = gov.month_to_date()  # ~$0.885 of $1.00
     assert spend.warning is True and spend.over_budget is False
+
+
+# ---- the other budget: tokens per day --------------------------------------
+#
+# The failure these cover is not overspending, it is the opposite: a FREE plan
+# whose daily token allowance runs out mid-evening, after which every answer
+# comes from a much weaker local model with nothing on screen to say so.
+
+
+def test_a_free_tier_provider_has_a_daily_token_cap_and_a_local_one_never_does() -> None:
+    assert daily_cap_for("groq") == 100_000
+    assert daily_cap_for("ollama") == 0, "local inference has no allowance to run out of"
+    assert daily_cap_for("anthropic") == 0, "no known free daily cap — don't invent one"
+    # moving off the free tier is a config change, not a code change
+    assert daily_cap_for("groq", override=500_000) == 500_000
+    assert daily_cap_for("ollama", override=500_000) == 0
+
+
+def test_today_counts_tokens_per_provider_against_the_daily_allowance(
+    events: EventStore,
+) -> None:
+    gov = CostGovernor(events, budget_usd=10.0)
+    for _ in range(4):
+        gov.record("groq", "llama-3.3-70b-versatile", {"input_tokens": 5_000, "output_tokens": 500})
+    gov.record("ollama", "llama3.2", {"input_tokens": 9_000, "output_tokens": 9_000})
+
+    day = gov.today()
+    assert day.calls == 5
+    groq, ollama = day.providers[0], day.providers[1]
+    assert groq.provider == "groq"  # busiest first
+    assert (groq.calls, groq.total_tokens, groq.cap) == (4, 22_000, 100_000)
+    assert groq.warning is False and groq.exhausted is False
+    assert ollama.capped is False and ollama.total_tokens == 18_000
+    # a rough "how much conversation is left", which a raw token count is not
+    assert groq.calls_left == 14  # 78,000 left at 5,500 a call
+
+
+def test_the_daily_gauge_warns_with_room_left_then_reports_exhaustion(
+    events: EventStore,
+) -> None:
+    gov = CostGovernor(events, budget_usd=10.0)
+    gov.record("groq", "llama-3.3-70b-versatile", {"input_tokens": 80_000, "output_tokens": 0})
+    hot = gov.today().pressured
+    assert hot is not None and hot.warning is True and hot.exhausted is False
+    assert hot.remaining_tokens == 20_000
+
+    gov.record("groq", "llama-3.3-70b-versatile", {"input_tokens": 25_000, "output_tokens": 0})
+    hot = gov.today().pressured
+    assert hot is not None and hot.exhausted is True and hot.remaining_tokens == 0
+
+
+def test_yesterdays_tokens_do_not_count_against_today(events: EventStore) -> None:
+    """The allowance resets; a gauge that never forgets would cry wolf every day."""
+    gov = CostGovernor(events, budget_usd=10.0)
+    gov.record("groq", "llama-3.3-70b-versatile", {"input_tokens": 99_000, "output_tokens": 0})
+    assert gov.today().pressured is not None
+
+    tomorrow = datetime.now(UTC) + timedelta(days=1)
+    day = gov.today(tomorrow)
+    assert day.providers == [] and day.pressured is None
+
+
+def test_the_daily_gauge_never_gates_a_call(events: EventStore) -> None:
+    """Deliberate: our tally starts whenever logging was deployed and a provider's
+    daily window need not match the local calendar day, so this number is honest as
+    a warning and would be wrong as a gate. The provider's 429 stays the authority."""
+    gov = CostGovernor(events, budget_usd=10.0)
+    gov.record("groq", "llama-3.3-70b-versatile", {"input_tokens": 200_000, "output_tokens": 0})
+    assert gov.today().pressured is not None  # visibly out of daily tokens
+    assert gov.cloud_allowed() is True  # and still allowed to try

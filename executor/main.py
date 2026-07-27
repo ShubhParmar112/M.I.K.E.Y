@@ -16,6 +16,15 @@ from executor.tools import Tools
 
 def serve(workspace: Path) -> None:
     tools = Tools(workspace)
+    # The protocol is UTF-8 in both directions, and must be said out loud: the core
+    # writes UTF-8 bytes down the pipe, but a child process on Windows decodes stdio
+    # in the system codepage (cp1252) unless told otherwise. Without this, every
+    # file M.I.K.E.Y wrote containing an em-dash, a curly quote, an accent or any
+    # non-Latin script was silently corrupted on its way INTO the sandbox, and
+    # reading such a file back returned mojibake to the model. `replace` rather than
+    # strict, because malformed input must not kill the sandbox loop.
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     for line in sys.stdin:
         line = line.strip()
         if not line:

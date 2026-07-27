@@ -142,6 +142,34 @@ def _preview_block(preview: dict[str, Any] | None) -> tuple[str, str]:
     return block, color
 
 
+def _quota_line(health: dict[str, Any]) -> str | None:
+    """A word about today's token allowance, when there is one worth saying.
+
+    The free tier runs out of tokens per day long before it runs out of anything
+    else, and the symptom is not an error — it is answers quietly getting worse
+    because a 3B local model took over. Saying it at the top of the conversation
+    is the difference between "M.I.K.E.Y is being stupid tonight" and "I have
+    about four good exchanges left".
+    """
+    providers = (health.get("today") or {}).get("providers") or []
+    at_risk = [p for p in providers if p.get("exhausted") or p.get("warning")]
+    if not at_risk:
+        return None
+    p = max(at_risk, key=lambda p: p.get("fraction", 0.0))
+    if p.get("exhausted"):
+        return (
+            f"[red]{p['provider']} has used its daily token allowance "
+            f"({p['tokens']:,}/{p['cap']:,}) — answers today come from the local model, "
+            "which is much weaker[/red]"
+        )
+    left = p.get("calls_left")
+    tail = f" — roughly {left} more calls" if left else ""
+    return (
+        f"[yellow]{p['provider']}: {p['tokens']:,}/{p['cap']:,} of today's tokens used"
+        f"{tail}[/yellow]"
+    )
+
+
 def _handle_approval(client: httpx.Client, ev: dict[str, Any]) -> None:
     args = json.dumps(ev.get("args", {}), ensure_ascii=False)
     body = f"[bold]{ev['tool']}[/bold]\n{args}\n[dim]{ev.get('reason', '')}[/dim]"
@@ -222,13 +250,15 @@ def chat(
         f"[yellow]continuing[/yellow] {session}" if continuing
         else f"[green]new conversation[/green] {session}"
     )
+    quota = _quota_line(health)
     console.print(
         Panel(
             f"{provider_line} · "
             f"build: {health.get('build', '?')} · "
             f"audit chain: {'[green]valid[/green]' if health['audit_chain_valid'] else '[red]BROKEN[/red]'} · "
             f"workspace: {CONFIG.workspace}\n"
-            f"{session_line} [dim]· /new starts another · /quit to leave[/dim]",
+            f"{session_line} [dim]· /new starts another · /quit to leave[/dim]"
+            + (f"\n{quota}" if quota else ""),
             title="M.I.K.E.Y",
         )
     )
@@ -685,9 +715,11 @@ def spend_cmd() -> None:
     CONFIG.ensure_dirs()
     db = Database(CONFIG.db_path)
     try:
-        spend = CostGovernor(
-            EventStore(db), CONFIG.monthly_budget_usd, CONFIG.device_id
-        ).month_to_date()
+        governor = CostGovernor(
+            EventStore(db), CONFIG.monthly_budget_usd, CONFIG.device_id, CONFIG.daily_token_cap
+        )
+        spend = governor.month_to_date()
+        day = governor.today()
     finally:
         db.close()
 
@@ -727,6 +759,48 @@ def spend_cmd() -> None:
             "[dim]note: some calls used a model with no entry in the price table and were "
             "charged at the conservative fallback rate — the real total is likely lower.[/dim]"
         )
+
+    # The other budget. On a free tier this is the one that actually runs out, and
+    # it runs out silently: the provider 429s and the weak local model takes over.
+    console.print()
+    today = Table(show_header=True, header_style="bold", title=f"tokens today · {day.day}")
+    today.add_column("provider")
+    today.add_column("calls", justify="right")
+    today.add_column("tokens", justify="right")
+    today.add_column("daily allowance", justify="right")
+    if not day.providers:
+        today.add_row("[dim]no model calls yet today[/dim]", "0", "0", "-")
+    for p in day.providers:
+        if not p.capped:
+            allowance = (
+                "[dim]local — free[/dim]" if p.total_tokens == 0 else "[dim]no known cap[/dim]"
+            )
+        else:
+            share = f"{p.fraction * 100:.0f}% of {p.cap:,}"
+            allowance = (
+                f"[red]{share}[/red]" if p.exhausted
+                else f"[yellow]{share}[/yellow]" if p.warning
+                else f"[green]{share}[/green]"
+            )
+        today.add_row(p.provider, str(p.calls), f"{p.total_tokens:,}", allowance)
+    console.print(today)
+
+    hot = day.pressured
+    if hot is not None and hot.exhausted:
+        console.print(
+            f"[red]{hot.provider}'s daily token allowance is gone[/red] — until it resets, "
+            "answers come from the local model, which is much weaker. This is the usual "
+            "cause of M.I.K.E.Y suddenly reasoning badly."
+        )
+    elif hot is not None:
+        left = f"~{hot.calls_left} more calls" if hot.calls_left is not None else "little left"
+        console.print(
+            f"[yellow]{hot.provider} has {hot.remaining_tokens:,} tokens left today "
+            f"({left} at today's average).[/yellow] After that, turns fall to the local model."
+        )
+    elif any(p.capped for p in day.providers):
+        console.print("[dim]counts only calls M.I.K.E.Y made — a lower bound on the "
+                      "provider's own tally.[/dim]")
 
 
 @app.command("plan")

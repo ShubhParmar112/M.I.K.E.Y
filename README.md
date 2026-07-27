@@ -86,7 +86,7 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 |---|---|
 | `mikey backup` | Verified snapshot of the whole store (log + audit chain). |
 | `mikey restore <path> [--yes]` | Restore from a backup (verifies it, snapshots current state first). |
-| `mikey spend` | This month's model spend per provider against the budget, and what happens when it runs out. |
+| `mikey spend` | This month's model spend per provider against the budget, and today's tokens against the free-tier **daily** allowance — the limit that actually runs out and silently drops answers onto the weak local model. |
 
 ## Simulate first, then ask
 
@@ -128,6 +128,27 @@ Prices are a dated, approximate table (`core/cost/governor.py`) — a model that
 isn't in it is charged at a deliberately high fallback rate rather than zero,
 because an unpriced model reading as free is how a budget silently stops binding.
 `mikey spend` says when a month's total was estimated that way.
+
+### The other budget: tokens per day
+
+On a paid plan the binding limit is dollars per month. On a **free** plan it is
+**tokens per day**, and running out doesn't look like an error — the provider
+429s, the gateway falls back, and every remaining turn that day is served by a
+much weaker local model. That is what an evening of unexplainably bad answers
+actually was. So the same ledger is also read per-day, per-provider, against the
+free-tier allowance (Groq: 100k tokens/day):
+
+```powershell
+$env:MIKEY_DAILY_TOKEN_CAP = "0"   # 0 = use the built-in free-tier table; set your real allowance if you've upgraded
+```
+
+`mikey spend` shows today's consumption and roughly how many calls are left at
+today's average call size, and `mikey chat` says so in the banner once the day's
+allowance is running out — before the answers get worse, not after. It is a
+gauge, deliberately **not** a gate: the count only includes calls M.I.K.E.Y made
+(a lower bound on the provider's own tally) and a provider's daily window need
+not match the local calendar day, so the 429 remains the authority on when to
+stop.
 
 ## Brains & local-first routing
 

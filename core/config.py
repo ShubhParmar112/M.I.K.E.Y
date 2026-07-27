@@ -99,6 +99,13 @@ class Config:
     monthly_budget_usd: float = field(
         default_factory=lambda: float(os.environ.get("MIKEY_MONTHLY_BUDGET_USD", "10"))
     )
+    # The other budget, and on a free plan the one that actually bites: tokens per
+    # DAY. 0 uses the built-in free-tier table (core.cost.governor); set
+    # MIKEY_DAILY_TOKEN_CAP to your real allowance if you've moved off the free
+    # tier, so the gauge tells the truth instead of crying wolf.
+    daily_token_cap: int = field(
+        default_factory=lambda: int(os.environ.get("MIKEY_DAILY_TOKEN_CAP", "0"))
+    )
     device_id: str = field(default_factory=lambda: os.environ.get("MIKEY_DEVICE", "dev_desktop_1"))
 
     @property

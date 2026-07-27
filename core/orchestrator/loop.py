@@ -44,6 +44,45 @@ MEMORY_TOOLS = {"memory_recall", "memory_remember", "memory_forget"}
 INPROCESS_TOOLS = MEMORY_TOOLS | {"ingest"}
 MEMORY_SNIPPET_CHARS = 700
 
+# What one tool result may contribute to the model's context.
+#
+# A tool result is not paid for once. It joins `messages` and is re-sent on EVERY
+# remaining step of the turn, so an unbounded one is charged again and again: the
+# executor allows a 1MB file read, which is ~250k tokens per subsequent call —
+# more than a free tier's entire daily allowance, spent on one file. The turn's
+# own history budget does not cover this; it bounds what is carried in from
+# earlier turns, not what this turn appends to itself.
+#
+# The model gets a bounded, explicitly-marked window. The full output is still
+# executed, still recorded in the event log, and still in the trace — only the
+# copy that rides along in the prompt is clamped.
+TOOL_RESULT_BUDGET_CHARS = 6_000
+# Head-weighted, but never head-only: a file's beginning identifies it, while a
+# failing command's reason is almost always its last few lines.
+TOOL_RESULT_HEAD_CHARS = 4_000
+
+
+def clamp_tool_result(text: str, budget: int = TOOL_RESULT_BUDGET_CHARS) -> str:
+    """Bound one tool result for the model's context, saying plainly what was cut.
+
+    Silent truncation is the dangerous version: the model would read a partial
+    file as the whole file and answer confidently about content it never saw.
+    """
+    if len(text) <= budget:
+        return text
+    head_chars = min(TOOL_RESULT_HEAD_CHARS, budget)
+    tail_chars = budget - head_chars
+    omitted = len(text) - budget
+    marker = (
+        f"\n\n[... {omitted:,} characters omitted from the middle of this result "
+        f"({len(text):,} in total). You are seeing the first {head_chars:,}"
+        + (f" and the last {tail_chars:,}" if tail_chars else "")
+        + " characters — this is NOT the whole thing, so do not answer as if it were. "
+        "If you need what is missing, ask for a narrower slice (a specific file, a "
+        "filtered command) rather than assuming. ...]\n\n"
+    )
+    return text[:head_chars] + marker + (text[-tail_chars:] if tail_chars else "")
+
 
 @dataclass
 class StreamEvent:
@@ -435,7 +474,15 @@ class Orchestrator:
                     {"tool": tc.name, "ok": ok, "output": result_text[:500]},
                 )
                 messages.append(
-                    ChatMessage(role="tool_result", text=result_text, tool_call_id=tc.id)
+                    ChatMessage(
+                        role="tool_result",
+                        # Clamped because this rides along on every remaining call of
+                        # the turn. The taint banner sits at the head of the text, so
+                        # keeping the head keeps the "this is data, not instructions"
+                        # marking with the content it applies to.
+                        text=clamp_tool_result(result_text),
+                        tool_call_id=tc.id,
+                    )
                 )
 
         yield StreamEvent(

@@ -119,7 +119,9 @@ def _make_routes(config: Config) -> dict[str, ModelAdapter]:
 
 def _make_governor(config: Config, events: EventStore) -> CostGovernor:
     """The monthly budget, backed by the event log as its ledger (Gen 3)."""
-    return CostGovernor(events, config.monthly_budget_usd, config.device_id)
+    return CostGovernor(
+        events, config.monthly_budget_usd, config.device_id, config.daily_token_cap
+    )
 
 
 def _make_gateway(
@@ -258,8 +260,30 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
 
     @app.get("/v1/health")
     async def health() -> dict[str, Any]:
-        spend = _make_governor(config, events).month_to_date()
+        governor = _make_governor(config, events)
+        spend = governor.month_to_date()
+        day = governor.today()
         return {
+            # Today's token consumption per provider, so a surface can warn before
+            # the free-tier daily allowance runs out and answers silently get worse.
+            "today": {
+                "day": day.day,
+                "tokens": day.total_tokens,
+                "calls": day.calls,
+                "providers": [
+                    {
+                        "provider": p.provider,
+                        "calls": p.calls,
+                        "tokens": p.total_tokens,
+                        "cap": p.cap,
+                        "fraction": round(p.fraction, 3),
+                        "calls_left": p.calls_left,
+                        "exhausted": p.exhausted,
+                        "warning": p.warning,
+                    }
+                    for p in day.providers
+                ],
+            },
             "ok": True,
             "provider": gateway.provider,
             "fallback": gateway.fallback_provider,
