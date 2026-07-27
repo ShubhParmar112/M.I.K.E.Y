@@ -61,6 +61,30 @@ RULES: dict[str, Decision] = {
     # Ingest reads a user-named file from anywhere on disk (outside the sandbox)
     # into memory — confirm the path with the user first.
     "ingest": Decision.ASK,
+    # Reach (Gen 3 automation). `git` splits by action below — reading a repository
+    # is nothing like pushing one. GitHub is read-only and returns other people's
+    # text, so it allows but taints. Opening a file or a URL launches a program and
+    # is visible on screen, so it asks.
+    "git": Decision.ASK,  # the floor; ACTION_RULES relaxes the read actions
+    "github": Decision.ALLOW,
+    "open": Decision.ASK,
+}
+
+# Tools whose verdict depends on WHICH operation is being asked for. Without this,
+# a single decision would have to cover both `git status` and `git push` — and
+# whichever way that went would be wrong: asking for every status read trains
+# people to approve without reading, and allowing pushes does not bear thinking
+# about. An action not named here is DENIED, so the allowlist stays the boundary.
+ACTION_RULES: dict[str, dict[str, Decision]] = {
+    "git": {
+        "status": Decision.ALLOW,
+        "log": Decision.ALLOW,
+        "diff": Decision.ALLOW,
+        "branches": Decision.ALLOW,
+        "unpushed": Decision.ALLOW,
+        "commit": Decision.ASK,
+        "push": Decision.ASK,
+    },
 }
 
 # Auto-allowed tools that stay allowed even on a tainted turn: they only READ
@@ -70,6 +94,15 @@ RULES: dict[str, Decision] = {
 TAINT_SAFE_TOOLS = {"memory_recall"}
 
 
+def base_decision(tool: str, args: dict[str, Any]) -> Decision | None:
+    """The rule-table verdict for an action, before taint and grants are applied.
+    None means "no rule" — which the caller turns into a denial."""
+    per_action = ACTION_RULES.get(tool)
+    if per_action is not None:
+        return per_action.get(str(args.get("action", "")).strip().lower())
+    return RULES.get(tool)
+
+
 class PolicyEngine:
     def __init__(self, db: Database) -> None:
         self._db = db
@@ -77,9 +110,14 @@ class PolicyEngine:
         self._session_grants: dict[str, set[str]] = {}
 
     def evaluate(self, req: ActionRequest) -> PolicyResult:
-        base = RULES.get(req.tool)
+        base = base_decision(req.tool, req.args)
         if base is None:
-            result = PolicyResult(Decision.DENY, f"tool '{req.tool}' is not in the policy table")
+            what = (
+                f"'{req.tool}' has no rule for action '{req.args.get('action')}'"
+                if req.tool in ACTION_RULES
+                else f"tool '{req.tool}' is not in the policy table"
+            )
+            result = PolicyResult(Decision.DENY, what)
         elif req.tainted and base is Decision.ALLOW and req.tool not in TAINT_SAFE_TOOLS:
             # Untrusted content may inform but never authorize (review W4). This
             # includes web_fetch: a tainted turn fetching a crafted URL is the
@@ -117,6 +155,10 @@ class PolicyEngine:
         if req.tool == "run_command":
             argv = req.args.get("command") or []
             return f"run_command:{argv[0] if argv else '?'}"
+        if req.tool in ACTION_RULES:
+            # A grant has to name the action too. "Approve git for this session"
+            # after reading a status must not quietly cover a push.
+            return f"{req.tool}:{str(req.args.get('action', '')).strip().lower()}"
         return req.tool
 
     # ---- hash-chained audit (review §5) ----

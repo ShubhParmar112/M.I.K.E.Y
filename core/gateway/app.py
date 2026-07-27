@@ -28,6 +28,7 @@ from core.orchestrator.loop import ApprovalRegistry, Orchestrator, stream_event_
 from core.policy.engine import PolicyEngine
 from core.proactive.nudge import NudgeStore
 from core.proactive.watch import Sentinel
+from core.reach.projects import ProjectRegistry
 from core.storage.db import Database
 from core.trace.store import TraceStore
 
@@ -215,8 +216,10 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
     # cloud→local hybrid + any per-brain S2 routes so a rate limit or dropped
     # connection isn't fatal and localized brains are served locally.
     gateway = _make_gateway(config, adapter, events)
+    projects = ProjectRegistry(events, config.device_id)
     orch = Orchestrator(
-        config, memory, traces, policy, gateway, executor, approvals, critic=Critic(gateway)
+        config, memory, traces, policy, gateway, executor, approvals,
+        critic=Critic(gateway), projects=projects,
     )
 
     # Proactivity (Gen 4): the gateway is the only thing that is always running, so

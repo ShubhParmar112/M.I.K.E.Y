@@ -1128,6 +1128,78 @@ PROVIDER_HELP: dict[str, tuple[str, str]] = {
 }
 
 
+project_app = typer.Typer(help="Directories M.I.K.E.Y may reach outside its sandbox.")
+app.add_typer(project_app, name="project")
+
+
+def _registry() -> Any:
+    from core.events.store import EventStore
+    from core.reach.projects import ProjectRegistry
+    from core.storage.db import Database
+
+    CONFIG.ensure_dirs()
+    return ProjectRegistry(EventStore(Database(CONFIG.db_path)), CONFIG.device_id)
+
+
+@project_app.command("add")
+def project_add(path: str = typer.Argument(..., help="the directory to open up")) -> None:
+    """Let M.I.K.E.Y work in a directory outside its sandbox.
+
+    This is a grant of authority, so keep it small: register the repository you're
+    working on, not your home directory. Everything inside a registered project is
+    readable, and git operations there become available — writes still go through
+    an approval card with a preview.
+
+    There is deliberately no tool for this. M.I.K.E.Y can use the reach you give it
+    and cannot give itself more, so nothing it reads can talk it into widening the
+    boundary.
+    """
+    try:
+        project = _registry().register(path)
+    except (NotADirectoryError, OSError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    kind = "git repository" if project.is_git_repo else "directory"
+    console.print(f"[green]registered[/green] {project.name} [dim]({kind} at {project.path})[/dim]")
+    if not project.is_git_repo:
+        console.print("[dim]not a git repository — file reach works, git actions won't[/dim]")
+
+
+@project_app.command("list")
+def project_list() -> None:
+    """Everything M.I.K.E.Y can reach outside its sandbox."""
+    projects = _registry().projects()
+    if not projects:
+        console.print(
+            "[dim]no projects registered — M.I.K.E.Y can only touch "
+            f"{CONFIG.workspace}[/dim]\n"
+            "[dim]`mikey project add <path>` opens one up[/dim]"
+        )
+        return
+    table = Table(show_header=True, header_style="bold", title="reachable projects")
+    table.add_column("name")
+    table.add_column("path")
+    table.add_column("git")
+    for project in projects:
+        table.add_row(
+            project.name,
+            str(project.path),
+            "[green]yes[/green]" if project.is_git_repo else "[dim]no[/dim]",
+        )
+    console.print(table)
+
+
+@project_app.command("remove")
+def project_remove(path: str = typer.Argument(..., help="the directory to close again")) -> None:
+    """Close a directory off again. Takes effect immediately."""
+    registry = _registry()
+    target = registry.get(path)
+    if target is None or not registry.forget(target.path):
+        console.print(f"[yellow]{path} isn't registered[/yellow]")
+        raise typer.Exit(1)
+    console.print(f"[green]closed[/green] {target.name} [dim]({target.path})[/dim]")
+
+
 @app.command("brief")
 def brief_cmd(
     hours: int = typer.Option(24, help="how far back to summarise"),

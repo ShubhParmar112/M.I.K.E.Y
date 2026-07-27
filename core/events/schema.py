@@ -52,6 +52,8 @@ class EventType(StrEnum):
     MODEL_USAGE = "model.usage"  # one model call's tokens + cost (the spend ledger)
     NUDGE_RAISED = "proactive.nudge.raised"  # something M.I.K.E.Y wants to say first
     NUDGE_DELIVERED = "proactive.nudge.delivered"  # ...and when it got said, or was dropped
+    PROJECT_REGISTERED = "reach.project.registered"  # a directory the user opened up
+    PROJECT_FORGOTTEN = "reach.project.forgotten"  # ...and closed again
 
 
 class Provenance(BaseModel):

@@ -67,6 +67,7 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 | `mikey events [--limit N]` | Recent raw events from the append-only log. |
 | `mikey brief [--hours N] [--speak]` | What happened and anything worth knowing — composed from the log, so it costs no quota and can't invent anything. |
 | `mikey nudges [--dismiss <id\|kind>]` | What M.I.K.E.Y is waiting to tell you, and what it has stopped mentioning. Dismissing a kind enough times mutes it for good. |
+| `mikey project add\|list\|remove <path>` | Which directories M.I.K.E.Y may reach outside its sandbox. No tool can do this — only you. |
 
 **Memory**
 
@@ -102,6 +103,44 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 | `mikey restore <path> [--yes]` | Restore from a backup (verifies it, snapshots current state first). |
 | `mikey spend` | This month's model spend per provider against the budget, and today's usage against each free-tier **daily** allowance — the limit that actually runs out and silently drops answers onto the weak local model. Providers are gauged by whichever allowance binds first (Groq counts tokens/day, Gemini counts requests/day). |
 | `mikey providers` | The whole answer chain: who is primary, who backs it up, which keys are missing, and what each free tier is worth. Tells you if you are one exhausted quota away from the 3B model. |
+
+## Reach: real projects, not just the sandbox
+
+Everything else runs inside one workspace directory with an allowlist of binaries.
+That is why M.I.K.E.Y has been safe to leave running, and also why it couldn't do
+the things you actually want — your repositories aren't in the sandbox, and
+neither is your editor. Reach opens specific doors:
+
+```powershell
+uv run mikey project add "C:\path\to\your\repo"   # you open a door; there is no tool for this
+uv run mikey project list
+uv run mikey project remove "C:\path\to\your\repo"
+```
+
+Then `git` works on that repository (status, log, diff, branches, unpushed —
+immediately; commit and push — through an approval card), `open` puts a file in
+your editor or a URL in your browser, and `github` reads a repo's pull requests
+and issues.
+
+The boundary is `core/reach/projects.py`, and it is the point of the package:
+
+- **A path is refused unless it resolves inside a directory you registered** —
+  after following symlinks and collapsing `..`, so neither is a way out. A sibling
+  directory of a registered project is still refused.
+- **There is deliberately no tool for registering one.** M.I.K.E.Y can use the
+  reach you give it and cannot give itself more, so nothing it reads can talk it
+  into widening the boundary. Registration is a CLI act, recorded in the log.
+- **Reading is free; writing is shown first.** A commit card shows the message and
+  exactly what is staged; a push card lists the commits that would be published
+  and names the remote's URL. `commit` never sweeps in files you didn't name, and
+  `push` cannot force — rewriting a remote's history is not something to get
+  wrong on someone's behalf.
+- **GitHub content is untrusted**, like a fetched web page: it's written by other
+  people, and one of those people may eventually address a sentence to an AI
+  rather than to you.
+
+Registering a directory is a grant of authority, so keep it small — register the
+repository you're working on, not your home directory.
 
 ## Speaking first
 

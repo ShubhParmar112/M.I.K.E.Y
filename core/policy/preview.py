@@ -33,7 +33,12 @@ MAX_DETAIL_CHARS = 4000
 # Tools whose effect is worth showing before it happens. Everything else on the
 # tool surface is a read (fs_read, fs_list, web_fetch, memory_recall) or an
 # append to M.I.K.E.Y's own state (memory_remember, ingest) — nothing to lose.
-PREVIEWABLE = frozenset({"fs_write", "run_command", "memory_forget"})
+PREVIEWABLE = frozenset({"fs_write", "run_command", "memory_forget", "git", "open"})
+
+# Reach actions worth simulating. A push is the one action on the whole surface
+# that leaves the machine and cannot be taken back, so it gets the fullest
+# preview: the exact commits that would land on someone else's server.
+PREVIEWABLE_GIT_ACTIONS = frozenset({"commit", "push"})
 
 
 @dataclass(frozen=True)
@@ -129,6 +134,20 @@ def classify(tool: str, args: dict[str, Any]) -> Impact:
         return Impact(True, False, "overwrites the file if it already exists")
     if tool == "memory_forget":
         return Impact(True, False, "tombstones a memory — gone from every projection")
+    if tool == "git":
+        action = str(args.get("action", "")).lower()
+        if action == "push":
+            # The only action here that leaves the machine. A pushed commit is on
+            # someone else's server and in everyone else's next fetch; "reversible"
+            # would mean a force-push, which this tool cannot do and should not.
+            return Impact(True, False, "publishes commits to the remote — cannot be unsent")
+        if action == "commit":
+            # Local, and undoable with `git reset` — but it writes history, and a
+            # commit with the wrong files in it is a real mess to unpick later.
+            return Impact(True, True, "writes a commit — local, and undoable with git reset")
+        return Impact(False, True, "reads the repository")
+    if tool == "open":
+        return Impact(False, True, "opens something on screen; changes nothing")
     if tool == "run_command":
         raw = args.get("command") or []
         argv = [str(c) for c in raw] if isinstance(raw, list) else []
@@ -192,6 +211,13 @@ class _NoteSource(Protocol):
     def note(self, event_id: str) -> Any: ...
 
 
+class _Projects(Protocol):
+    """The reach boundary, as the previewer needs it (core.reach.ProjectRegistry).
+    A preview resolves paths through exactly the same door the real action will."""
+
+    def resolve(self, raw: str) -> Any: ...
+
+
 class Previewer:
     """Builds the preview for an action, without performing it.
 
@@ -199,9 +225,15 @@ class Previewer:
     preview cannot read outside the workspace either; `memory` supplies the text
     behind a `memory_forget` id."""
 
-    def __init__(self, executor: _Executor, memory: _NoteSource | None = None) -> None:
+    def __init__(
+        self,
+        executor: _Executor,
+        memory: _NoteSource | None = None,
+        projects: _Projects | None = None,
+    ) -> None:
         self._executor = executor
         self._memory = memory
+        self._projects = projects
 
     async def preview(self, tool: str, args: dict[str, Any]) -> Preview | None:
         """None means "nothing to preview" (a read). Never raises: a preview that
@@ -214,6 +246,10 @@ class Previewer:
                 return await self._preview_write(args)
             if tool == "run_command":
                 return await self._preview_command(args)
+            if tool == "git":
+                return self._preview_git(args)
+            if tool == "open":
+                return self._preview_open(args)
             return self._preview_forget(args)
         except Exception as exc:  # noqa: BLE001 — a broken preview must not eat the turn
             impact = classify(tool, args)
@@ -309,6 +345,105 @@ class Previewer:
             destructive=True,
             reversible=impact.reversible,
             simulated=True,
+        )
+
+    def _preview_git(self, args: dict[str, Any]) -> Preview | None:
+        """What a commit would record, or what a push would send.
+
+        Both are read-only simulations built from the repository itself: `git diff
+        --cached` for the one, the unpushed commits and the remote's URL for the
+        other. The push card names the remote, because "publishes commits" and
+        "publishes commits *to this address*" are different amounts of information.
+        """
+        from core.reach.git import Repo
+
+        action = str(args.get("action", "")).lower()
+        if action not in PREVIEWABLE_GIT_ACTIONS:
+            return None
+        impact = classify("git", args)
+        if self._projects is None:
+            return Preview(
+                tool="git",
+                summary=f"git {action} — {impact.why}",
+                detail="No project registry available, so this could not be simulated.",
+                destructive=impact.destructive,
+                reversible=impact.reversible,
+                simulated=False,
+            )
+        repo = Repo(self._projects.resolve(str(args.get("project", "."))))
+
+        if action == "commit":
+            staged = repo.run(["diff", "--cached", "--stat"])
+            named = [str(p) for p in (args.get("paths") or [])]
+            extra = repo.run(["status", "--short", "--", *named]) if named else None
+            message = str(args.get("message", "")).strip()
+            body = f"message: {message or '(missing)'}\n\nalready staged:\n{staged.output}"
+            if extra is not None:
+                body += f"\n\nwould also stage:\n{extra.output}"
+            return Preview(
+                tool="git",
+                summary=f"commits to {repo.path.name} — {impact.why}",
+                detail=_clip(body),
+                destructive=impact.destructive,
+                reversible=impact.reversible,
+                simulated=staged.ok,
+            )
+
+        unpushed = repo.unpushed()
+        remote_name = str(args.get("remote", "") or "origin")
+        remote = repo.run(["remote", "get-url", remote_name])
+        where = remote.output if remote.ok else f"{remote_name} (unknown URL)"
+        if unpushed.ok and unpushed.output.strip() in ("", "(no output)"):
+            return Preview(
+                tool="git",
+                summary=f"nothing to push from {repo.path.name} — the branch matches its upstream",
+                detail=f"remote: {where}",
+                destructive=False,
+                reversible=True,
+                simulated=True,
+            )
+        listed = unpushed.output if unpushed.ok else "(could not list unpushed commits)"
+        count = len([ln for ln in listed.splitlines() if ln.strip()]) if unpushed.ok else 0
+        return Preview(
+            tool="git",
+            summary=f"pushes {count or 'some'} commit(s) from {repo.path.name} to {where} "
+            "— cannot be unsent",
+            detail=_clip(f"commits that would be published:\n{listed}"),
+            destructive=True,
+            reversible=False,
+            simulated=unpushed.ok,
+        )
+
+    def _preview_open(self, args: dict[str, Any]) -> Preview:
+        """Nothing is destroyed, but what is about to appear on screen — and, for a
+        URL, which host is about to be contacted — is worth showing first."""
+        target = str(args.get("target", "")).strip()
+        if target.lower().startswith(("http://", "https://")):
+            from urllib.parse import urlparse
+
+            host = urlparse(target).netloc or "?"
+            return Preview(
+                tool="open",
+                summary=f"opens {host} in your browser",
+                detail=target,
+                destructive=False,
+                reversible=True,
+                simulated=True,
+            )
+        detail = target
+        if self._projects is not None:
+            try:
+                resolved = self._projects.resolve(target)
+                detail = f"{resolved}" + ("" if resolved.exists() else "  (does not exist)")
+            except Exception as exc:  # noqa: BLE001 — surfaced on the card, not raised
+                detail = f"{target}\n{exc}"
+        return Preview(
+            tool="open",
+            summary=f"opens {PurePath(target).name or target} in your editor",
+            detail=detail,
+            destructive=False,
+            reversible=True,
+            simulated=self._projects is not None,
         )
 
     def _preview_forget(self, args: dict[str, Any]) -> Preview:

@@ -28,6 +28,7 @@ from core.orchestrator.critic import Critic
 from core.orchestrator.tiering import classify_tier
 from core.policy.engine import ActionRequest, Decision, PolicyEngine
 from core.policy.preview import PREVIEWABLE, Preview, Previewer
+from core.reach.projects import ProjectRegistry
 from core.trace.store import TraceStore
 
 MAX_STEPS = 12  # hard stop against runaway loops (review M8's tiny Gen 1 cousin)
@@ -41,7 +42,12 @@ BRAIN_HINT_TTL = timedelta(minutes=30)
 # M.I.K.E.Y's own state, and `ingest` reads a user-named file (possibly outside
 # the workspace) into memory — both need core-side access the sandbox denies.
 MEMORY_TOOLS = {"memory_recall", "memory_remember", "memory_forget"}
-INPROCESS_TOOLS = MEMORY_TOOLS | {"ingest"}
+# Reach tools run here too, and for the opposite reason to everything else: their
+# whole purpose is to act OUTSIDE the sandbox, on repositories and applications the
+# executor is built to refuse. Their boundary is the project registry instead —
+# see core/reach/projects.py, which the user controls and the model cannot.
+REACH_TOOLS = {"git", "github", "open"}
+INPROCESS_TOOLS = MEMORY_TOOLS | {"ingest"} | REACH_TOOLS
 MEMORY_SNIPPET_CHARS = 700
 
 # What one tool result may contribute to the model's context.
@@ -120,6 +126,7 @@ class Orchestrator:
         executor: ExecutorClient,
         approvals: ApprovalRegistry,
         critic: Critic | None = None,
+        projects: ProjectRegistry | None = None,
     ) -> None:
         self._config = config
         self._memory = memory
@@ -135,7 +142,11 @@ class Orchestrator:
         # Simulate-first (Gen 3): builds the "here is what this will actually do"
         # preview shown on every destructive approval card. Uses the same confined
         # executor as the real action, so previewing can't reach further than doing.
-        self._previewer = Previewer(executor, memory)
+        # Which directories the reach tools may touch. None means none: without a
+        # registry every reach tool refuses, which is the right default for a
+        # caller that never opted in (tests, one-off tooling).
+        self._projects = projects
+        self._previewer = Previewer(executor, memory, projects)
         self._assembler = ContextAssembler(
             memory.events, memory, config.context_budget_chars
         )
@@ -686,6 +697,8 @@ class Orchestrator:
         taints the turn if any hit is untrusted; remember persists a durable note
         whose trust mirrors the turn's (a tainted turn can only plant an untrusted
         fact, and policy has already forced that path through the user)."""
+        if name in REACH_TOOLS:
+            return self._call_reach_tool(name, args)
         if name == "memory_recall":
             query = str(args.get("query", "")).strip()
             if not query:
@@ -801,6 +814,98 @@ class Orchestrator:
             return ExecResult(True, msg, False)
 
         return ExecResult(False, f"unknown in-process tool: {name}", False)
+
+    def _call_reach_tool(self, name: str, args: dict[str, Any]) -> ExecResult:
+        """Tools that act outside the sandbox, on things the user registered.
+
+        Every path goes through `ProjectRegistry.resolve`, which refuses anything
+        outside a registered project — and with no registry at all, refuses
+        everything. A refusal is returned as a failed result rather than raised:
+        the model should be told it cannot reach there and what would fix it, not
+        have the turn collapse."""
+        from core.reach.desktop import OpenRefused, open_in_editor, open_url
+        from core.reach.git import Repo
+        from core.reach.github import GitHub, GitHubError
+        from core.reach.projects import OutsideReach
+
+        if name == "github":
+            # Never touches the filesystem, so the project registry is irrelevant —
+            # but everything it returns is other people's writing, so it comes back
+            # tainted and any action later in the turn escalates to an approval.
+            repo_name = str(args.get("repo", "")).strip()
+            if "/" not in repo_name:
+                return ExecResult(False, "github needs a repo as 'owner/name'.", False)
+            action = str(args.get("action", "")).lower()
+            state = str(args.get("state", "open")).lower()
+            try:
+                client = GitHub()
+                if action == "repo":
+                    result = client.repo(repo_name)
+                elif action == "pulls":
+                    result = client.pulls(repo_name, state)
+                elif action == "issues":
+                    result = client.issues(repo_name, state)
+                else:
+                    return ExecResult(False, f"unknown github action '{action}'.", False)
+            except GitHubError as exc:
+                return ExecResult(False, str(exc), False)
+            return ExecResult(result.ok, result.output, result.tainted)
+
+        if self._projects is None:
+            return ExecResult(
+                False,
+                "I can't reach anything outside my workspace — no projects are "
+                "registered. Ask the user to run `mikey project add <path>`.",
+                False,
+            )
+
+        if name == "open":
+            target = str(args.get("target", "")).strip()
+            if not target:
+                return ExecResult(False, "open needs a 'target'.", False)
+            try:
+                if target.lower().startswith(("http://", "https://")):
+                    opened = open_url(target)
+                else:
+                    line = int(args.get("line", 0) or 0)
+                    opened = open_in_editor(self._projects.resolve(target), line)
+            except (OpenRefused, OutsideReach) as exc:
+                return ExecResult(False, str(exc), False)
+            except (OSError, ValueError) as exc:
+                return ExecResult(False, f"could not open it: {exc}", False)
+            return ExecResult(opened.ok, opened.output, False)
+
+        # git
+        action = str(args.get("action", "")).lower()
+        try:
+            repo = Repo(self._projects.resolve(str(args.get("project", "."))))
+        except OutsideReach as exc:
+            return ExecResult(False, str(exc), False)
+        if not repo.is_repo:
+            return ExecResult(False, f"{repo.path} is not a git repository.", False)
+
+        if action == "status":
+            out = repo.status()
+        elif action == "log":
+            out = repo.log(int(args.get("limit", 10) or 10), str(args.get("path", "")))
+        elif action == "diff":
+            out = repo.diff(str(args.get("path", "")), bool(args.get("staged", False)))
+        elif action == "branches":
+            out = repo.branches()
+        elif action == "unpushed":
+            out = repo.unpushed()
+        elif action == "commit":
+            paths = [str(p) for p in (args.get("paths") or [])]
+            out = repo.commit(str(args.get("message", "")), paths)
+        elif action == "push":
+            out = repo.push(str(args.get("remote", "")), str(args.get("branch", "")))
+        else:
+            return ExecResult(False, f"unknown git action '{action}'.", False)
+        # A repository the user registered is their own work, not third-party
+        # content, so its output is not tainted the way a fetched page is. (Commit
+        # messages from other contributors are the edge here; that is a reason to
+        # register repositories deliberately, which registration already requires.)
+        return ExecResult(out.ok, out.output, False)
 
 
 def stream_event_json(ev: StreamEvent) -> str:
