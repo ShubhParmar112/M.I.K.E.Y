@@ -6,7 +6,6 @@ Binds to localhost only in Gen 1.
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -15,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from core.config import CONFIG, Config
+from core.config import CONFIG, Config, available_cloud_providers
 from core.cost.governor import CostGovernor
 from core.events.store import EventStore
 from core.executor_client import ExecutorClient
@@ -47,6 +46,22 @@ def _make_adapter(config: Config, provider: str | None = None) -> ModelAdapter:
             temperature=config.temperature,
             max_output_tokens=config.max_output_tokens,
         )
+    if provider == "cerebras":
+        from core.models.cerebras_adapter import CerebrasAdapter
+
+        return CerebrasAdapter(
+            config.cerebras_model,
+            temperature=config.temperature,
+            max_output_tokens=config.max_output_tokens,
+        )
+    if provider == "gemini":
+        from core.models.gemini_adapter import GeminiAdapter
+
+        return GeminiAdapter(
+            config.gemini_model,
+            temperature=config.temperature,
+            max_output_tokens=config.max_output_tokens,
+        )
     if provider == "ollama":
         from core.models.ollama_adapter import OllamaAdapter
 
@@ -60,26 +75,26 @@ def _make_adapter(config: Config, provider: str | None = None) -> ModelAdapter:
 
 
 def _make_fallbacks(config: Config) -> list[ModelAdapter]:
-    """An ordered failover chain: a second cloud model (if its key is present and
-    it isn't already primary), then the local model last for offline coverage —
-    e.g. groq → claude → ollama. So a rate limit rolls to the next link, not to a
-    hard error and not straight to the weak local model."""
+    """An ordered failover chain: every OTHER cloud provider whose key is present,
+    in preference order, then the local model last for offline coverage — e.g.
+    groq → cerebras → gemini → ollama.
+
+    The shape matters more than the order. With one cloud key, running out of its
+    daily allowance means every answer for the rest of the day comes from a 3B
+    local model, which is the difference between an assistant and a toy; that is
+    what actually happened here on a Monday evening. Each additional free tier is
+    an independent daily allowance, and they run out under different conditions
+    (Groq counts tokens per day, Gemini counts requests, Cerebras limits requests
+    per minute), so the chain degrades in steps rather than off a cliff.
+    """
     chain: list[ModelAdapter] = []
-    if config.provider != "anthropic" and os.environ.get("ANTHROPIC_API_KEY"):
-        from core.models.anthropic_adapter import AnthropicAdapter
-
-        chain.append(AnthropicAdapter(config.anthropic_model))
-    if config.provider != "groq" and os.environ.get("GROQ_API_KEY"):
-        from core.models.groq_adapter import GroqAdapter
-
-        chain.append(
-            GroqAdapter(
-                config.groq_model,
-                temperature=config.temperature,
-                max_output_tokens=config.max_output_tokens,
-            )
-        )
-    if config.local_fallback and config.provider in ("groq", "anthropic"):
+    for provider in available_cloud_providers():
+        if provider != config.provider:
+            chain.append(_make_adapter(config, provider))
+    # The local model is the last link, and only behind a cloud primary: it costs
+    # nothing and works offline, which is exactly what a safety net should be — and
+    # exactly what it should not be asked to do while any cloud model can answer.
+    if config.local_fallback and config.provider != "ollama":
         from core.models.ollama_adapter import OllamaAdapter
 
         chain.append(
@@ -276,6 +291,8 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
                         "calls": p.calls,
                         "tokens": p.total_tokens,
                         "cap": p.cap,
+                        "call_cap": p.call_cap,
+                        "metered_by": p.metered_by,
                         "fraction": round(p.fraction, 3),
                         "calls_left": p.calls_left,
                         "exhausted": p.exhausted,
@@ -287,6 +304,9 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
             "ok": True,
             "provider": gateway.provider,
             "fallback": gateway.fallback_provider,
+            # Providers currently skipped because they said they were out of quota,
+            # and when they may be tried again.
+            "sidelined": gateway.sidelined,
             "local_brains": list(config.local_brains),  # brains served on-device (S2)
             "routed_capabilities": gateway.routed_capabilities,
             "build": build,

@@ -24,6 +24,7 @@ from rich.table import Table
 from rich.tree import Tree
 
 from core.config import CONFIG
+from core.cost.governor import LOCAL_PROVIDERS
 
 if TYPE_CHECKING:
     from core.orchestrator.loop import ApprovalRegistry, StreamEvent
@@ -100,19 +101,36 @@ def _served_tag(ev: dict[str, Any], primary: str) -> str:
 
 
 def _fallback_subtitle(ev: dict[str, Any], primary: str) -> str | None:
+    """What to say when someone other than the primary answered.
+
+    The distinction that matters is not *which* provider took over but whether it
+    was another cloud model or the 3B local one — the first is a step sideways, the
+    second is the point at which answers stop being trustworthy on anything
+    multi-step. Saying "rate-limited" for either is what left a whole evening's bad
+    answers looking like M.I.K.E.Y had simply got stupid.
+    """
     served = ev.get("served_by")
     if not served or served == primary:
         return None
+    local = served in LOCAL_PROVIDERS
     if ev.get("quota_exhausted"):
-        # A daily cap is not a blip: every answer for the rest of the day comes from
-        # the small local model. Saying "rate-limited" here reads as "try again in a
-        # second" and leaves the person wondering why M.I.K.E.Y suddenly got worse.
+        if not local:
+            return (
+                f"[yellow]{primary} is out of quota for today — {served} is covering. "
+                "Quality should be comparable.[/yellow]"
+            )
         return (
-            f"[red]{primary} is OUT OF QUOTA FOR TODAY — answers now come from "
-            f"{served}, a much weaker local model. Expect mistakes on anything "
-            "multi-step until the quota resets.[/red]"
+            f"[red]{primary} is OUT OF QUOTA FOR TODAY and there is no other cloud "
+            f"provider configured — answers now come from {served}, a much weaker "
+            "local model. Expect mistakes on anything multi-step until the quota "
+            "resets. `mikey providers` shows how to add another.[/red]"
         )
-    return f"[yellow]on local model ({served}) — {primary} was rate-limited/offline[/yellow]"
+    if not local:
+        return f"[dim]answered by {served} — {primary} was rate-limited/offline[/dim]"
+    return (
+        f"[yellow]on local model ({served}) — every cloud provider was "
+        "rate-limited or offline[/yellow]"
+    )
 
 
 def _preview_block(preview: dict[str, Any] | None) -> tuple[str, str]:
@@ -156,21 +174,41 @@ def _quota_line(health: dict[str, Any]) -> str | None:
     if not at_risk:
         return None
     p = max(at_risk, key=lambda p: p.get("fraction", 0.0))
+    # Whether this matters depends entirely on what is behind it: a spent allowance
+    # with another cloud provider in the chain is a non-event.
+    backup = [
+        name for name in _chain_providers(health)
+        if name != p["provider"] and name not in LOCAL_PROVIDERS
+    ]
+    used = (
+        f"{p['calls']:,}/{p['call_cap']:,} of today's requests"
+        if p.get("metered_by") == "calls"
+        else f"{p['tokens']:,}/{p['cap']:,} of today's tokens"
+    )
     if p.get("exhausted"):
+        if backup:
+            return f"[dim]{p['provider']} has used {used} — {backup[0]} is covering[/dim]"
         return (
-            f"[red]{p['provider']} has used its daily token allowance "
-            f"({p['tokens']:,}/{p['cap']:,}) — answers today come from the local model, "
-            "which is much weaker[/red]"
+            f"[red]{p['provider']} has used {used} — answers today come from the "
+            "local model, which is much weaker. `mikey providers` shows how to add "
+            "another cloud provider[/red]"
         )
     left = p.get("calls_left")
     tail = f" — roughly {left} more calls" if left else ""
-    return (
-        f"[yellow]{p['provider']}: {p['tokens']:,}/{p['cap']:,} of today's tokens used"
-        f"{tail}[/yellow]"
-    )
+    color = "dim" if backup else "yellow"
+    return f"[{color}]{p['provider']}: {used} used{tail}[/{color}]"
 
 
-def _handle_approval(client: httpx.Client, ev: dict[str, Any]) -> None:
+def _chain_providers(health: dict[str, Any]) -> list[str]:
+    """Every provider that could serve a turn, primary first."""
+    chain = [str(health.get("provider", ""))]
+    chain += [f.strip() for f in str(health.get("fallback") or "").split(",") if f.strip()]
+    return [c for c in chain if c]
+
+
+def _handle_approval(
+    client: httpx.Client, ev: dict[str, Any], mouth: Any | None = None
+) -> None:
     args = json.dumps(ev.get("args", {}), ensure_ascii=False)
     body = f"[bold]{ev['tool']}[/bold]\n{args}\n[dim]{ev.get('reason', '')}[/dim]"
     # A second brain's read of the action, when present (S1 critic).
@@ -179,11 +217,24 @@ def _handle_approval(client: httpx.Client, ev: dict[str, Any]) -> None:
         color = "green" if ev.get("critic_sound") else "red"
         label = "critic" if ev.get("critic_sound") else "CRITIC!"  # ASCII: see _preview_block
         body += f"\n[{color}]{label}: {note}[/{color}]"
+    preview = ev.get("preview") or {}
     block, border = _preview_block(ev.get("preview"))
     body += block
     console.print(
         Panel(body, title="approval required", border_style=border)
     )
+    if mouth is not None:
+        # Read the request out, then point at the keyboard. A spoken "yes" must
+        # never authorise an action — a television, a housemate or a video call can
+        # all say yes, and none of them are the person M.I.K.E.Y works for.
+        from core.voice.session import approval_announcement
+
+        _speak(
+            mouth,
+            approval_announcement(
+                ev["tool"], str(ev.get("reason", "")), bool(preview.get("destructive"))
+            ),
+        )
     answer = console.input("[yellow]approve? \\[y]es / \\[n]o / \\[s]ession: [/yellow]").strip().lower()
     approved = answer in ("y", "yes", "s", "session")
     scope = "session" if answer in ("s", "session") else "once"
@@ -289,60 +340,198 @@ def chat(
                     console.print("[dim]no turn yet[/dim]")
                 continue
 
-            # A spinner so a slow turn (e.g. a cold local-model fallback) reads as
-            # "working", not "frozen". Ctrl+C here cancels the turn — closing the
-            # stream disconnects the client, which cancels the turn server-side —
-            # and drops back to the prompt instead of killing the whole session.
-            status = console.status("[dim]thinking…[/dim]", spinner="dots")
-            try:
-                status.start()
-                with client.stream(
-                    "POST", f"{BASE}/v1/turns", json={"session_id": session, "input": user_input}
-                ) as resp:
-                    for line in resp.iter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        ev = json.loads(line[6:])
-                        kind = ev["kind"]
-                        status.stop()
-                        if kind == "status":
-                            last_turn = ev["turn_id"]
-                            # Surface when a non-default brain handled the turn, so
-                            # the routing (S1) is visible — e.g. a sign-off going to
-                            # the toolless conversation brain.
-                            if ev.get("brain") and ev["brain"] != "operator":
-                                console.print(f"[dim]· {ev['brain']} brain[/dim]")
-                            # And flag a private turn kept on-device (S3).
-                            if ev.get("tier") == "T0":
-                                console.print("[green]· private — kept on-device[/green]")
-                        elif kind == "action":
-                            args = json.dumps(ev["args"], ensure_ascii=False)[:120]
-                            console.print(f"[dim]→ {ev['tool']} {args}[/dim]{_served_tag(ev, primary)}")
-                        elif kind == "approval_request":
-                            _handle_approval(client, ev)
-                        elif kind == "action_result":
-                            mark = "[green]ok[/green]" if ev["ok"] else "[red]failed[/red]"
-                            console.print(f"[dim]← {ev['tool']} {mark}[/dim]")
-                        elif kind == "final":
-                            console.print(Panel(
-                                ev["text"], border_style="cyan", title="mikey",
-                                subtitle=_fallback_subtitle(ev, primary),
-                            ))
-                        elif kind == "error":
-                            console.print(f"[red]error:[/red] {ev['message']}")
-                        if kind not in ("final", "error"):
-                            status.start()  # resume the spinner while the turn continues
-            except KeyboardInterrupt:
-                console.print(
-                    "\n[dim](turn canceled — any in-flight action may still finish)[/dim]"
-                )
-            except httpx.HTTPError as exc:
-                console.print(
-                    f"[red]turn aborted:[/red] {type(exc).__name__}: {exc} — "
-                    "the gateway may have restarted; try again"
-                )
-            finally:
+            last_turn = _run_turn(client, session, user_input, primary) or last_turn
+
+
+def _run_turn(
+    client: httpx.Client,
+    session: str,
+    user_input: str,
+    primary: str,
+    mouth: Any | None = None,
+) -> str | None:
+    """Stream one turn to the console — and, with a `mouth`, out loud. Returns the
+    turn id, or None if the turn never got far enough to have one.
+
+    Text chat and voice chat run the same loop deliberately: a spoken session shows
+    the same approval cards, the same fallback warnings and the same traces. A
+    second, simpler loop for voice is how a surface ends up quietly missing the
+    safety furniture the other one has.
+    """
+    # A spinner so a slow turn (e.g. a cold local-model fallback) reads as
+    # "working", not "frozen". Ctrl+C here cancels the turn — closing the
+    # stream disconnects the client, which cancels the turn server-side —
+    # and drops back to the prompt instead of killing the whole session.
+    status = console.status("[dim]thinking…[/dim]", spinner="dots")
+    turn_id: str | None = None
+    tier = "T1"
+    try:
+        status.start()
+        with client.stream(
+            "POST", f"{BASE}/v1/turns", json={"session_id": session, "input": user_input}
+        ) as resp:
+            for line in resp.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                ev = json.loads(line[6:])
+                kind = ev["kind"]
                 status.stop()
+                if kind == "status":
+                    turn_id = ev["turn_id"]
+                    # Surface when a non-default brain handled the turn, so
+                    # the routing (S1) is visible — e.g. a sign-off going to
+                    # the toolless conversation brain.
+                    if ev.get("brain") and ev["brain"] != "operator":
+                        console.print(f"[dim]· {ev['brain']} brain[/dim]")
+                    # And flag a private turn kept on-device (S3).
+                    if ev.get("tier") == "T0":
+                        tier = "T0"
+                        console.print("[green]· private — kept on-device[/green]")
+                elif kind == "action":
+                    args = json.dumps(ev["args"], ensure_ascii=False)[:120]
+                    console.print(f"[dim]→ {ev['tool']} {args}[/dim]{_served_tag(ev, primary)}")
+                elif kind == "approval_request":
+                    _handle_approval(client, ev, mouth)
+                elif kind == "action_result":
+                    mark = "[green]ok[/green]" if ev["ok"] else "[red]failed[/red]"
+                    console.print(f"[dim]← {ev['tool']} {mark}[/dim]")
+                elif kind == "final":
+                    console.print(Panel(
+                        ev["text"], border_style="cyan", title="mikey",
+                        subtitle=_fallback_subtitle(ev, primary),
+                    ))
+                    _speak(mouth, ev["text"], tier)
+                elif kind == "error":
+                    console.print(f"[red]error:[/red] {ev['message']}")
+                    _speak(mouth, "Something went wrong on that one.", tier)
+                if kind not in ("final", "error"):
+                    status.start()  # resume the spinner while the turn continues
+    except KeyboardInterrupt:
+        console.print(
+            "\n[dim](turn canceled — any in-flight action may still finish)[/dim]"
+        )
+        if mouth is not None:
+            mouth.hush()
+    except httpx.HTTPError as exc:
+        console.print(
+            f"[red]turn aborted:[/red] {type(exc).__name__}: {exc} — "
+            "the gateway may have restarted; try again"
+        )
+    finally:
+        status.stop()
+    return turn_id
+
+
+def _speak(mouth: Any | None, text: str, tier: str = "T1") -> None:
+    """Say something, and mention it once if the voice couldn't."""
+    if mouth is None:
+        return
+    from core.events.schema import Tier
+
+    if not mouth.say(text, Tier.T0 if tier == "T0" else Tier.T1) and mouth.last_error:
+        console.print(f"[dim](voice: {mouth.last_error})[/dim]")
+        mouth.last_error = None
+
+
+@app.command()
+def voice(
+    session: str = typer.Option("", help="resume a named session (default: start a new one)"),
+    resume: bool = typer.Option(
+        False, "--continue", "-c", help="continue the most recent conversation"
+    ),
+    synth: str = typer.Option("", help="voice: local (private, offline) | edge (neural) | off"),
+    listen_only: bool = typer.Option(
+        False, "--mute", help="listen and transcribe, but reply in text only"
+    ),
+) -> None:
+    """Talk to M.I.K.E.Y and hear it back.
+
+    Speech recognition runs on this machine, so what you say never leaves it.
+    Approvals still go through the keyboard: voice widens what you can ask for, it
+    does not widen what can be authorised. Say "stop" while it's talking to cut it
+    off, "goodbye" to end the session.
+    """
+    from core.voice.listen import Ears, Microphone, MicrophoneUnavailable, WhisperTranscriber
+    from core.voice.mouth import Mouth
+    from core.voice.session import Decision, interpret
+    from core.voice.synth import make_synth
+
+    _ensure_server()
+    health = httpx.get(f"{BASE}/v1/health", timeout=5.0).json()
+    primary = health["provider"]
+
+    kind = (synth or CONFIG.voice_synth).lower()
+    if listen_only:
+        kind = "off"
+    tiered = make_synth(kind, CONFIG.voice_name)
+    mouth = Mouth(tiered) if tiered is not None else None
+
+    transcriber = WhisperTranscriber(CONFIG.stt_model)
+    ears = Ears(Microphone(), transcriber)
+    with console.status("[dim]loading the speech model…[/dim]", spinner="dots"):
+        try:
+            transcriber.load()
+        except MicrophoneUnavailable as exc:
+            console.print(f"[red]voice unavailable:[/red] {exc}")
+            console.print("[dim]install the extra with: uv sync --extra voice[/dim]")
+            raise typer.Exit(1) from exc
+
+    if session:
+        continuing = True
+    elif resume:
+        session, continuing = _latest_session_id() or _new_session_id(), True
+    else:
+        session, continuing = _new_session_id(), False
+
+    voice_line = (
+        f"voice: [bold]{kind}[/bold]" + (" [dim](on-device)[/dim]" if kind == "local" else "")
+        if mouth is not None
+        else "voice: [dim]muted — replies on screen only[/dim]"
+    )
+    console.print(
+        Panel(
+            f"{voice_line} · hearing: [bold]{CONFIG.stt_model}[/bold] [dim](on-device)[/dim] · "
+            f"provider: {primary}\n"
+            + (f"[yellow]continuing[/yellow] {session}" if continuing
+               else f"[green]new conversation[/green] {session}")
+            + "\n[dim]speak after the prompt · \"stop\" cuts it off · \"goodbye\" ends · "
+            "Ctrl+C to quit · `mikey chat` to type[/dim]",
+            title="M.I.K.E.Y — voice",
+        )
+    )
+
+    quota = _quota_line(health)
+    if quota:
+        console.print(quota)
+
+    with httpx.Client(timeout=None) as client:
+        while True:
+            try:
+                console.print("[bold cyan]listening…[/bold cyan]")
+                heard = ears.listen()
+            except MicrophoneUnavailable as exc:
+                console.print(f"[red]microphone stopped:[/red] {exc}")
+                return
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]bye[/dim]")
+                return
+
+            said = interpret(heard.text, speaking=mouth is not None and mouth.speaking)
+            if said.decision is Decision.IGNORE:
+                if heard.text.strip():
+                    console.print(f"[dim](ignored: “{heard.text.strip()}”)[/dim]")
+                continue
+            if said.decision is Decision.END_SESSION:
+                _speak(mouth, "Goodbye.")
+                console.print("[dim]bye[/dim]")
+                return
+            if said.decision is Decision.STOP_TALKING:
+                if mouth is not None:
+                    mouth.hush()
+                continue
+
+            console.print(f"[bold cyan]you>[/bold cyan] {said.text}")
+            _run_turn(client, session, said.text, primary, mouth)
 
 
 def _print_trace(turn_id: str) -> None:
@@ -776,7 +965,8 @@ def spend_cmd() -> None:
                 "[dim]local — free[/dim]" if p.total_tokens == 0 else "[dim]no known cap[/dim]"
             )
         else:
-            share = f"{p.fraction * 100:.0f}% of {p.cap:,}"
+            limit = f"{p.call_cap:,} calls" if p.metered_by == "calls" else f"{p.cap:,}"
+            share = f"{p.fraction * 100:.0f}% of {limit}"
             allowance = (
                 f"[red]{share}[/red]" if p.exhausted
                 else f"[yellow]{share}[/yellow]" if p.warning
@@ -787,11 +977,21 @@ def spend_cmd() -> None:
 
     hot = day.pressured
     if hot is not None and hot.exhausted:
-        console.print(
-            f"[red]{hot.provider}'s daily token allowance is gone[/red] — until it resets, "
-            "answers come from the local model, which is much weaker. This is the usual "
-            "cause of M.I.K.E.Y suddenly reasoning badly."
-        )
+        from core.config import available_cloud_providers
+
+        others = [p for p in available_cloud_providers() if p != hot.provider]
+        if others:
+            console.print(
+                f"[dim]{hot.provider}'s daily allowance is gone — {others[0]} is covering "
+                "for the rest of the day.[/dim]"
+            )
+        else:
+            console.print(
+                f"[red]{hot.provider}'s daily allowance is gone[/red] — until it resets, "
+                "answers come from the local model, which is much weaker. This is the usual "
+                "cause of M.I.K.E.Y suddenly reasoning badly. `mikey providers` shows how to "
+                "add a second free provider so this stops happening."
+            )
     elif hot is not None:
         left = f"~{hot.calls_left} more calls" if hot.calls_left is not None else "little left"
         console.print(
@@ -801,6 +1001,93 @@ def spend_cmd() -> None:
     elif any(p.capped for p in day.providers):
         console.print("[dim]counts only calls M.I.K.E.Y made — a lower bound on the "
                       "provider's own tally.[/dim]")
+
+
+# How to get a key for each provider, and what its free tier is actually worth.
+# Approximate and dated (mid-2026) — free tiers move, and the point here is the
+# order of magnitude, not the decimal.
+PROVIDER_HELP: dict[str, tuple[str, str]] = {
+    "anthropic": (
+        "console.anthropic.com",
+        "paid — the strongest model in the chain; ~$8/month at this usage",
+    ),
+    "groq": (
+        "console.groq.com/keys",
+        "free — fastest, but only ~100k tokens/day (about 8-12 exchanges)",
+    ),
+    "cerebras": (
+        "cloud.cerebras.ai",
+        "free — ~1M tokens/day, roughly 10x Groq's allowance",
+    ),
+    "gemini": (
+        "aistudio.google.com/apikey",
+        "free — metered in requests/day, so long documents cost nothing extra",
+    ),
+}
+
+
+@app.command("providers")
+def providers_cmd() -> None:
+    """Which models can answer, in what order, and what is missing.
+
+    One cloud key is a single point of failure with a quiet failure mode: the day's
+    allowance runs out, every remaining answer comes from a 3B local model, and
+    nothing says so except the answers getting worse. This is the page that makes
+    that visible before it happens.
+    """
+    from core.config import CLOUD_PROVIDERS, available_cloud_providers
+
+    have = available_cloud_providers()
+    table = Table(show_header=True, header_style="bold", title="model providers")
+    table.add_column("provider")
+    table.add_column("role")
+    table.add_column("key")
+    table.add_column("free tier")
+
+    for name, env in CLOUD_PROVIDERS:
+        where, note = PROVIDER_HELP[name]
+        if name == CONFIG.provider:
+            role = "[bold green]primary[/bold green]"
+        elif name in have:
+            role = f"fallback #{have.index(name)}"
+        else:
+            role = "[dim]not configured[/dim]"
+        key = "[green]set[/green]" if name in have else f"[dim]{env}[/dim]"
+        table.add_row(name, role, key, note if name in have else f"{note} · {where}")
+
+    local_role = "[bold green]primary[/bold green]" if CONFIG.provider == "ollama" else (
+        "last resort" if CONFIG.local_fallback else "[dim]disabled[/dim]"
+    )
+    table.add_row(
+        f"ollama [dim]({CONFIG.fallback_ollama_model})[/dim]",
+        local_role,
+        "[green]local[/green]",
+        "free, offline, and much weaker — a safety net, not a plan",
+    )
+    console.print(table)
+
+    clouds = len(have)
+    if clouds == 0:
+        console.print(
+            "[red]No cloud provider is configured[/red] — every answer comes from the local "
+            "3B model, which cannot reliably do multi-step reasoning. Add one free key above."
+        )
+    elif clouds == 1:
+        missing = next(n for n, _ in CLOUD_PROVIDERS if n not in have and n != "anthropic")
+        where, _note = PROVIDER_HELP[missing]
+        console.print(
+            f"[yellow]One cloud provider.[/yellow] When {have[0]}'s daily allowance runs out, "
+            "the rest of the day is served by the local model. A second free key removes that "
+            f"cliff entirely:\n"
+            f"  1. get a key at [bold]{where}[/bold]\n"
+            f"  2. [bold]setx {dict(CLOUD_PROVIDERS)[missing]} \"your-key\"[/bold]\n"
+            "  3. open a new terminal and restart the gateway"
+        )
+    else:
+        console.print(
+            f"[green]{clouds} cloud providers configured[/green] — if one runs out of quota, "
+            "the next one answers. The local model is only used if all of them are down."
+        )
 
 
 @app.command("plan")
@@ -974,12 +1261,30 @@ def doctor() -> None:
         )
     )
 
-    keys = [k for k in ("GROQ", "ANTHROPIC") if os.environ.get(f"{k}_API_KEY")]
+    from core.config import available_cloud_providers
+    from core.gateway.app import _make_fallbacks
+
+    have = available_cloud_providers()
+    chain = " -> ".join([CONFIG.provider, *(a.name for a in _make_fallbacks(CONFIG))])
+    # One cloud provider is the setup that silently degrades: when its daily
+    # allowance goes, so does every good answer for the rest of the day.
+    if len(have) == 0:
+        depth = "[red]no cloud provider — every answer comes from the local 3B model[/red]"
+    elif len(have) == 1:
+        depth = (
+            f"[yellow]one cloud provider — when {have[0]} runs out of quota, the rest of "
+            "the day falls to the local model. `mikey providers` shows how to add another"
+            "[/yellow]"
+        )
+    else:
+        depth = f"[green]{len(have)} cloud providers — one running out is covered[/green]"
     console.print(
         Panel(
             f"primary provider: [bold]{CONFIG.provider}[/bold]\n"
-            f"api keys set: {', '.join(keys) or '[yellow]none[/yellow]'}\n"
-            f"cloud->local fallback: {'on' if CONFIG.local_fallback else 'off'}",
+            f"answer chain: {chain}\n"
+            f"keys set: {', '.join(have) or '[yellow]none[/yellow]'}\n"
+            f"cloud->local fallback: {'on' if CONFIG.local_fallback else 'off'}\n"
+            f"{depth}",
             title="cloud models",
         )
     )

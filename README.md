@@ -24,16 +24,27 @@ This repository contains a working **Gen 1–3 core** — append-only event log,
 
 ```powershell
 uv sync                      # install
-uv run pytest                # verify (273 passing)
+uv run pytest                # verify (328 passing)
 
-# pick a model provider (any of the three):
-$env:GROQ_API_KEY = "gsk_..."               # cloud (Groq, free tier, Llama 3.3), or:
-$env:ANTHROPIC_API_KEY = "sk-ant-..."       # cloud (Claude), or:
-# install Ollama + `ollama pull llama3.2`   # local / private
+# pick a model provider — and ideally more than one (see below):
+$env:GROQ_API_KEY = "gsk_..."               # cloud, free: fastest, ~100k tokens/day
+$env:CEREBRAS_API_KEY = "csk-..."           # cloud, free: ~1M tokens/day
+$env:GEMINI_API_KEY = "AIza..."             # cloud, free: metered in requests/day
+$env:ANTHROPIC_API_KEY = "sk-ant-..."       # cloud, paid: the strongest of them
+# install Ollama + `ollama pull llama3.2`   # local / private / offline
 
+uv run mikey providers       # who can answer, in what order, and what's missing
 uv run mikey doctor          # check providers, local models, brain routing, integrity
 uv run mikey chat            # interactive chat with approval cards + trace
 ```
+
+**Configure more than one.** A single free tier is a single point of failure with
+a silent failure mode: its daily allowance runs out mid-evening, every remaining
+answer is served by the 3B local model, and nothing announces it except the
+answers getting worse. Every key you add is an independent daily allowance —
+M.I.K.E.Y walks the chain (`groq → cerebras → gemini → ollama`), and a provider
+that reports it is out for the day is set aside rather than asked again on every
+call. The local model goes back to being what it should be: the offline net.
 
 After `uv sync`, run any command as `uv run mikey <command>` (or `mikey <command>` with the venv active). Run `mikey doctor` anytime to see your effective setup.
 
@@ -50,6 +61,7 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 | Command | What it does |
 |---|---|
 | `mikey chat` | Interactive session — routes each turn through the brain fleet, streams actions + approval cards (with the critic's note), header shows which brains run locally. **Each run is a new conversation**; `--continue` resumes the last one, `--session <id>` names one. `/new`, `/trace` and `/quit` work inside. |
+| `mikey voice` | Talk to it and hear it back. Hearing and (by default) speaking run **on this machine**; same brains, same approval cards, same traces as `mikey chat`. `--synth edge` for a neural voice, `--mute` to listen but reply in text. Needs `uv sync --extra voice`. |
 | `mikey serve` | Run the gateway in the foreground (for a separate terminal). |
 | `mikey trace [turn_id]` | "Why did you do that?" — the full reasoning tree for a turn (route → model call → policy → tool). Defaults to the last turn. |
 | `mikey events [--limit N]` | Recent raw events from the append-only log. |
@@ -86,7 +98,37 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 |---|---|
 | `mikey backup` | Verified snapshot of the whole store (log + audit chain). |
 | `mikey restore <path> [--yes]` | Restore from a backup (verifies it, snapshots current state first). |
-| `mikey spend` | This month's model spend per provider against the budget, and today's tokens against the free-tier **daily** allowance — the limit that actually runs out and silently drops answers onto the weak local model. |
+| `mikey spend` | This month's model spend per provider against the budget, and today's usage against each free-tier **daily** allowance — the limit that actually runs out and silently drops answers onto the weak local model. Providers are gauged by whichever allowance binds first (Groq counts tokens/day, Gemini counts requests/day). |
+| `mikey providers` | The whole answer chain: who is primary, who backs it up, which keys are missing, and what each free tier is worth. Tells you if you are one exhausted quota away from the 3B model. |
+
+## Voice
+
+```powershell
+uv sync --extra voice          # speech model + audio bindings (optional)
+uv run mikey voice             # speak; it speaks back
+```
+
+Speech recognition runs locally (faster-whisper on the CPU): **what you say never
+leaves the machine.** The default voice is Windows' own — offline, private, and
+frankly robotic. `--synth edge` swaps in Microsoft's neural voices, which sound
+human but send the text of each spoken reply over the network; a **Tier-0 (private)
+turn is never given to a cloud voice** and falls back to the local one, the same
+rule the model gateway enforces at the other end of the turn.
+
+Three behaviours are worth knowing, because they're deliberate:
+
+- **A spoken word never approves an action.** When something needs approval,
+  M.I.K.E.Y reads the request aloud and then waits for the keyboard. A television,
+  a housemate, or a video call can all say "yes"; none of them are you.
+- **Silence isn't a question.** Handed a cough or a door, a transcriber returns
+  confident text ("Thank you." is the classic). Anything that isn't clearly speech
+  is dropped and shown as dropped, rather than spent as a turn.
+- **You can talk over it.** Say "stop" while it's speaking and it stops mid-word;
+  "goodbye" ends the session.
+
+What it says is not what it wrote: code blocks, tables and URLs are described
+rather than read out, arithmetic is verbalised ("180 × 190 / 200" → "180 times 190
+over 200"), and a long answer stops early and says the rest is on screen.
 
 ## Simulate first, then ask
 
@@ -150,6 +192,15 @@ gauge, deliberately **not** a gate: the count only includes calls M.I.K.E.Y made
 not match the local calendar day, so the 429 remains the authority on when to
 stop.
 
+The gauge tells you the cliff is coming. What stops you falling off it is having
+somewhere else to go: **configure a second free provider** (`mikey providers`).
+When one reports a daily cap, M.I.K.E.Y sets it aside — for the time the provider
+itself named, or an hour if it named none — and the next cloud model in the chain
+answers instead, at comparable quality. Only when every cloud provider is out or
+offline does the local 3B model take a turn, and the chat banner says which of
+those two things happened, because they mean very different things about how much
+to trust the answer.
+
 ## Brains & local-first routing
 
 Every turn is routed to one of a small fleet of **brains** — each a capability profile (prompt + tool allowlist), not a separate model:
@@ -198,7 +249,7 @@ Useful env knobs: `MIKEY_LOCAL_BRAINS` (brains to run locally), `MIKEY_OLLAMA_MO
 |---|---|
 | Event log (append-only, versioned schema, SQLite WAL) | ✅ `core/events/` |
 | Context assembly (history + provenance-annotated memory, traced) | ✅ `core/context/` |
-| Model gateway (Groq / Anthropic / Ollama / fake · tier + capability routing) | ✅ `core/models/` |
+| Model gateway (Groq / Cerebras / Gemini / Anthropic / Ollama / fake · failover chain · tier + capability routing) | ✅ `core/models/` |
 | Policy engine + hash-chained audit + taint rule | ✅ `core/policy/` |
 | Executor sandbox (separate process, path confinement, command allowlist) | ✅ `executor/` |
 | Turn loop + brain fleet (router · conversation · reasoning · operator · memory · critic · planner) | ✅ `core/orchestrator/` |

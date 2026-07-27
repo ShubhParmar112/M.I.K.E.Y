@@ -56,6 +56,13 @@ PRICES: dict[str, Price] = {
     "claude-opus": Price(15.0, 75.0),
     "claude-sonnet": Price(3.0, 15.0),
     "claude-haiku": Price(1.0, 5.0),
+    "gpt-oss-120b": Price(0.25, 0.69),
+    "gemma-4": Price(0.30, 0.50),
+    "zai-glm": Price(0.60, 2.20),
+    "gemini-2.5-flash-lite": Price(0.10, 0.40),
+    "gemini-2.5-flash": Price(0.30, 2.50),
+    "gemini-2.5-pro": Price(1.25, 10.0),
+    "gemini-3": Price(0.50, 3.00),
 }
 
 # What an unrecognized cloud model costs, for budgeting purposes. Set high on
@@ -76,7 +83,14 @@ WARN_AT = 0.8
 # how a whole evening's answers got worse with no visible cause. This table
 # exists to make the cliff visible while there is still room to do something
 # about it.
-FREE_TIER_DAILY_TOKENS: dict[str, int] = {"groq": 100_000}
+FREE_TIER_DAILY_TOKENS: dict[str, int] = {"groq": 100_000, "cerebras": 1_000_000}
+
+# The same cliff, measured the other way. Google's free tier counts REQUESTS per
+# day rather than tokens, so a token gauge would read 0% right up until it stopped
+# answering. The number is for the default Flash model and is deliberately the
+# conservative end of the published range — a gauge that warns slightly early is
+# useful; one that warns after the fact is not.
+FREE_TIER_DAILY_CALLS: dict[str, int] = {"gemini": 250}
 
 # Fraction of a daily allowance at which to start saying so. Lower than the
 # monthly WARN_AT: a day's allowance can go in a single long conversation, so the
@@ -94,6 +108,13 @@ def daily_cap_for(provider: str, override: int = 0) -> int:
     if cap and override > 0:
         return override
     return cap
+
+
+def daily_call_cap_for(provider: str) -> int:
+    """Requests this provider allows per day; 0 means "not metered that way"."""
+    if provider in LOCAL_PROVIDERS:
+        return 0
+    return FREE_TIER_DAILY_CALLS.get(provider, 0)
 
 
 def price_for(provider: str, model: str) -> tuple[Price, bool]:
@@ -146,7 +167,8 @@ class ProviderDay:
     calls: int
     input_tokens: int
     output_tokens: int
-    cap: int = 0  # 0 = no known daily cap
+    cap: int = 0  # 0 = no known daily token cap
+    call_cap: int = 0  # 0 = not metered by request count
 
     @property
     def total_tokens(self) -> int:
@@ -154,11 +176,32 @@ class ProviderDay:
 
     @property
     def capped(self) -> bool:
-        return self.cap > 0
+        return self.cap > 0 or self.call_cap > 0
+
+    @property
+    def token_fraction(self) -> float:
+        return self.total_tokens / self.cap if self.cap > 0 else 0.0
+
+    @property
+    def call_fraction(self) -> float:
+        return self.calls / self.call_cap if self.call_cap > 0 else 0.0
 
     @property
     def fraction(self) -> float:
-        return self.total_tokens / self.cap if self.capped else 0.0
+        """How close this provider is to whichever of its allowances binds first.
+
+        Providers meter free use differently — tokens per day, requests per day —
+        and the one that runs out first is the one that matters. Taking the maximum
+        means a provider is never reported as comfortable because the allowance
+        nobody is spending still looks fine."""
+        return max(self.token_fraction, self.call_fraction)
+
+    @property
+    def metered_by(self) -> str:
+        """Which allowance is the binding one, for a surface that wants to say so."""
+        if self.call_cap > 0 and self.call_fraction >= self.token_fraction:
+            return "calls"
+        return "tokens"
 
     @property
     def exhausted(self) -> bool:
@@ -166,7 +209,7 @@ class ProviderDay:
         # bound on what the provider has counted. That asymmetry is why this is safe
         # to report as fact: if our own tally has passed the cap, the provider's has
         # too. The converse does not hold, so being under it proves nothing.
-        return self.capped and self.total_tokens >= self.cap
+        return self.capped and self.fraction >= 1.0
 
     @property
     def warning(self) -> bool:
@@ -174,17 +217,23 @@ class ProviderDay:
 
     @property
     def remaining_tokens(self) -> int:
-        return max(0, self.cap - self.total_tokens) if self.capped else 0
+        return max(0, self.cap - self.total_tokens) if self.cap > 0 else 0
 
     @property
     def calls_left(self) -> int | None:
         """Roughly how many more calls fit in what's left, at today's average call
         size. None when there's no cap or nothing to average yet.
 
-        A token count is hard to act on; "about four more exchanges" is not."""
+        A token count is hard to act on; "about four more exchanges" is not. When a
+        provider meters both ways, the smaller of the two answers is the true one."""
         if not self.capped or self.calls == 0:
             return None
-        return int(self.remaining_tokens // max(1, self.total_tokens / self.calls))
+        limits: list[int] = []
+        if self.cap > 0:
+            limits.append(int(self.remaining_tokens // max(1, self.total_tokens / self.calls)))
+        if self.call_cap > 0:
+            limits.append(max(0, self.call_cap - self.calls))
+        return min(limits) if limits else None
 
 
 @dataclass(frozen=True)
@@ -341,6 +390,7 @@ class CostGovernor:
                 input_tokens=inp,
                 output_tokens=out,
                 cap=daily_cap_for(provider, self._daily_cap_override),
+                call_cap=daily_call_cap_for(provider),
             )
             for provider, (calls, inp, out) in totals.items()
         ]

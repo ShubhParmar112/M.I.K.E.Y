@@ -11,12 +11,30 @@ def _default_home() -> Path:
     return Path(os.environ.get("MIKEY_HOME", str(Path.home() / ".mikey")))
 
 
+# Cloud providers M.I.K.E.Y can speak to, in the order they are preferred when no
+# provider is named — and, past the first, the order of the failover chain. The
+# key of each is what decides whether it is available at all.
+#
+# The ordering is "best answer first, then whatever is still free": Anthropic when
+# it is paid for, then Groq (fastest, but the smallest free daily allowance by an
+# order of magnitude), then the roomier free tiers. Running out of one is then a
+# step sideways to another cloud model rather than a fall onto the 3B local one.
+CLOUD_PROVIDERS: tuple[tuple[str, str], ...] = (
+    ("anthropic", "ANTHROPIC_API_KEY"),
+    ("groq", "GROQ_API_KEY"),
+    ("cerebras", "CEREBRAS_API_KEY"),
+    ("gemini", "GEMINI_API_KEY"),
+)
+
+
+def available_cloud_providers() -> list[str]:
+    """Cloud providers with a key present, in preference order."""
+    return [name for name, env in CLOUD_PROVIDERS if os.environ.get(env)]
+
+
 def _detect_provider() -> str:
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return "anthropic"
-    if os.environ.get("GROQ_API_KEY"):
-        return "groq"
-    return "ollama"
+    providers = available_cloud_providers()
+    return providers[0] if providers else "ollama"
 
 
 @dataclass(frozen=True)
@@ -35,6 +53,16 @@ class Config:
     )
     groq_model: str = field(
         default_factory=lambda: os.environ.get("MIKEY_GROQ_MODEL", "llama-3.3-70b-versatile")
+    )
+    # The other two free tiers. Both are far roomier than Groq's 100k tokens/day —
+    # which is the whole reason they are here: one free tier is a single point of
+    # failure, and its failure mode is every answer for the rest of the day coming
+    # from a 3B local model.
+    cerebras_model: str = field(
+        default_factory=lambda: os.environ.get("MIKEY_CEREBRAS_MODEL", "gpt-oss-120b")
+    )
+    gemini_model: str = field(
+        default_factory=lambda: os.environ.get("MIKEY_GEMINI_MODEL", "gemini-2.5-flash")
     )
     # Hybrid routing: when a cloud provider is primary, fall back to a local
     # Ollama model on rate-limit/offline. Set MIKEY_LOCAL_FALLBACK=0 to disable.
@@ -106,6 +134,18 @@ class Config:
     daily_token_cap: int = field(
         default_factory=lambda: int(os.environ.get("MIKEY_DAILY_TOKEN_CAP", "0"))
     )
+    # --- voice (optional: `uv sync --extra voice`) ---
+    # Which voice speaks. "local" = Windows' own speech: offline, private, robotic.
+    # "edge" = Microsoft's neural voices: sounds human, but sends the text of every
+    # spoken reply over the network — so it is never used for a Tier-0 turn, which
+    # falls back to the local voice instead. "off" = text only.
+    voice_synth: str = field(
+        default_factory=lambda: os.environ.get("MIKEY_VOICE", "local").lower()
+    )
+    voice_name: str = field(default_factory=lambda: os.environ.get("MIKEY_VOICE_NAME", ""))
+    # Speech recognition always runs on-device. tiny.en answers in well under a
+    # second on this CPU; base.en is more accurate and roughly twice the wait.
+    stt_model: str = field(default_factory=lambda: os.environ.get("MIKEY_STT_MODEL", "tiny.en"))
     device_id: str = field(default_factory=lambda: os.environ.get("MIKEY_DEVICE", "dev_desktop_1"))
 
     @property

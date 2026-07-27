@@ -8,9 +8,17 @@ implementable later (privacy tiers route here at Gen 2+).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
-from core.events.schema import Tier
+from core.events.schema import Tier, now
+
+# How long a provider that reported a DAILY quota is left alone when it didn't say
+# when to come back. Long enough to stop paying a failed round-trip per model call
+# (a turn makes several), short enough that a quota window rolling over is noticed
+# within the hour rather than at midnight.
+DEFAULT_DAILY_COOLDOWN = timedelta(hours=1)
+MAX_COOLDOWN = timedelta(hours=24)
 
 
 @dataclass
@@ -159,6 +167,35 @@ class ModelGateway:
         # everything you ask today comes from the weaker model".
         self.last_fallback_reason: str | None = None
         self.last_fallback_daily = False
+        # Providers that told us they are out for the day, and when they may be
+        # tried again. Without this, every model call of every turn for the rest of
+        # the day pays a failed round-trip to a provider we already know has
+        # nothing left — several times per turn, since a turn makes several calls.
+        self._sidelined: dict[str, datetime] = {}
+
+    @property
+    def sidelined(self) -> dict[str, str]:
+        """provider -> ISO time it may be tried again, for health/observability."""
+        at = now()
+        return {n: t.isoformat() for n, t in self._sidelined.items() if t > at}
+
+    def _available(self, candidates: list[ModelAdapter]) -> list[ModelAdapter]:
+        """Drop providers known to be out of quota — unless that would leave
+        nothing, in which case try them anyway. Our record can be stale (a quota
+        window may have rolled over early), and a stale note must never be the
+        reason a turn fails outright."""
+        at = now()
+        live = [a for a in candidates if self._sidelined.get(a.name, at) <= at]
+        return live or candidates
+
+    def _sideline(self, adapter: ModelAdapter, exc: ModelUnavailable) -> None:
+        """Remember that a provider is finished for now. The provider's own
+        retry-after is trusted when it gives one — a daily cap usually comes with
+        the time the window rolls over, which is better than any guess."""
+        wait = DEFAULT_DAILY_COOLDOWN
+        if exc.retry_after and exc.retry_after > 0:
+            wait = min(timedelta(seconds=float(exc.retry_after)), MAX_COOLDOWN)
+        self._sidelined[adapter.name] = now() + wait
 
     @property
     def routed_capabilities(self) -> dict[str, str]:
@@ -223,6 +260,10 @@ class ModelGateway:
                 )
             candidates = local_only
 
+        # A provider that has already told us it is out for the day is skipped
+        # rather than asked again. The order of what remains is unchanged.
+        candidates = self._available(candidates)
+
         errors: list[ModelUnavailable] = []
         for adapter in candidates:
             try:
@@ -230,6 +271,8 @@ class ModelGateway:
                 self.last_provider = adapter.name
                 self.last_fallback_reason = errors[0].reason if errors else None
                 self.last_fallback_daily = bool(errors and errors[0].daily)
+                if adapter.name in self._sidelined:
+                    del self._sidelined[adapter.name]  # it's answering again
                 if self._governor is not None:
                     # Bill the adapter that actually served, not the one asked —
                     # a fallback to local is genuinely free and must read as free.
@@ -243,6 +286,8 @@ class ModelGateway:
                 return resp
             except ModelUnavailable as exc:
                 errors.append(exc)  # this provider is down; try the next link
+                if exc.daily:
+                    self._sideline(adapter, exc)
 
         primary_err = errors[0]
         if len(errors) == 1:  # nothing to fall back to
