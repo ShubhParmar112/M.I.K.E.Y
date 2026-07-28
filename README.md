@@ -24,7 +24,7 @@ This repository contains a working **Gen 1–3 core** — append-only event log,
 
 ```powershell
 uv sync                      # install
-uv run pytest                # verify (328 passing)
+uv run pytest                # verify (442 passing)
 
 # pick a model provider — and ideally more than one (see below):
 $env:GROQ_API_KEY = "gsk_..."               # cloud, free: fastest, ~100k tokens/day
@@ -36,6 +36,7 @@ $env:ANTHROPIC_API_KEY = "sk-ant-..."       # cloud, paid: the strongest of them
 uv run mikey providers       # who can answer, in what order, and what's missing
 uv run mikey doctor          # check providers, local models, brain routing, integrity
 uv run mikey chat            # interactive chat with approval cards + trace
+uv run mikey hud             # the same, full-screen, with the state panel (--extra tui)
 ```
 
 **Configure more than one.** A single free tier is a single point of failure with
@@ -62,6 +63,7 @@ Remembered facts are kept clean: a near-duplicate is skipped, a correction can `
 |---|---|
 | `mikey chat` | Interactive session — routes each turn through the brain fleet, streams actions + approval cards (with the critic's note), header shows which brains run locally. **Each run is a new conversation**; `--continue` resumes the last one, `--session <id>` names one. `/new`, `/trace` and `/quit` work inside. |
 | `mikey voice` | Talk to it and hear it back. Hearing and (by default) speaking run **on this machine**; same brains, same approval cards, same traces as `mikey chat`. `--synth edge` for a neural voice, `--mute` to listen but reply in text. Needs `uv sync --extra voice`. |
+| `mikey hud` | The same conversation full-screen, with a live panel: who answered the last turn, today's allowance per provider, stood-down providers, spend, audit chain, open missions. Approvals are keyboard-only (`y`/`s`/`n`, never Enter). `ctrl+n` starts a new conversation. Needs `uv sync --extra tui`. |
 | `mikey serve` | Run the gateway in the foreground (for a separate terminal). |
 | `mikey trace [turn_id]` | "Why did you do that?" — the full reasoning tree for a turn (route → model call → policy → tool). Defaults to the last turn. |
 | `mikey events [--limit N]` | Recent raw events from the append-only log. |
@@ -171,6 +173,41 @@ is worse than a silent one, since you have also stopped trusting it:
 
 Set `MIKEY_PROACTIVE=0` to keep it strictly reactive, or
 `MIKEY_PROACTIVE_INTERVAL` to change how often it looks (default 300s).
+
+## The HUD
+
+```powershell
+uv sync --extra tui            # textual (optional)
+uv run mikey hud               # chat on the left, state on the right
+```
+
+`mikey chat` tells you the state of the system once, in a banner, and then that
+banner scrolls away. Every "M.I.K.E.Y got worse tonight" in this project's history
+turned out to be a fact that *was* knowable at the time — the daily allowance had
+run out, a 3B local model had taken over, the audit chain had broken — and had
+been printed an hour earlier to a screen nobody was still looking at. The HUD's
+job is to keep that answer in view.
+
+The right-hand panel shows who answered the **last** turn (not who was configured
+to), the provider chain, today's allowance per provider as a gauge, any provider
+currently stood down and when it's back, month-to-date spend, whether the audit
+chain still verifies, and unfinished missions. It refreshes while you work.
+
+The headline has four weights on purpose. Reversed red and reversed amber are for
+the states that change what you should do; plain amber is for things worth
+noticing ("86% through today's tokens, ~2 calls left"); green means there is
+genuinely nothing to say. A banner that is amber every evening stops being read,
+and a calm green "~2 calls left" is not read either.
+
+What it deliberately is **not** is a second implementation. The turn protocol
+(`apps/surface.py`) and the approval card text are shared with `mikey chat` and
+`mikey voice`, and the nudge restraint is the same `choose()` — a surface that
+grows its own turn loop is a surface that quietly ends up missing one of the
+warnings the others have. Approvals are keyboard-only and Enter is not one of the
+keys: `y` approves once, `s` for the session, `n`/escape denies.
+
+Everything the panel shows is also available without the extra, from `mikey
+chat`, `mikey spend`, `mikey providers` and `mikey doctor`.
 
 ## Voice
 
@@ -330,6 +367,10 @@ Useful env knobs: `MIKEY_LOCAL_BRAINS` (brains to run locally), `MIKEY_OLLAMA_MO
 | Memory: hybrid FTS + vector retrieval, ingestion, verified forgetting, taint | ✅ `core/memory/`, `core/ingest/` |
 | Session gateway API (SSE streaming, approvals, traces) | ✅ `core/gateway/` |
 | CLI with approval cards, trace viewer, doctor, planner | ✅ `apps/cli/` |
+| Voice: on-device speech in and out, T0 never given to a cloud voice | ✅ `core/voice/` |
+| Speaking first: nudges as events, restraint as pure logic, log-only brief | ✅ `core/proactive/` |
+| Reach beyond the sandbox: registered projects, git, GitHub (read-only), editor/browser | ✅ `core/reach/` |
+| Presence: full-screen HUD — who is answering, allowance, integrity, missions | ✅ `core/presence/`, `apps/tui/` |
 | Sovereignty S0–S2: T0 enforcement · data exporter · reasoning eval · per-brain local routing | ✅ `training/`, `core/eval/`, `core/models/` |
 | CI (ruff + pytest on every push) | ✅ `.github/workflows/` |
 | Local reasoning brains, training/distillation pipeline, knowledge graph | ⏳ next |

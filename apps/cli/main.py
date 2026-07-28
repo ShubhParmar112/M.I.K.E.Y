@@ -18,11 +18,18 @@ import httpx
 import typer
 import uvicorn
 from rich.console import Console
-from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 
+from apps.surface import (
+    BASE,
+    approval_body,
+    send_approval,
+    stream_turn,
+)
+from apps.surface import preview_block as _preview_block
+from apps.surface import served_tag as _served_tag
 from core.config import CONFIG
 from core.cost.governor import LOCAL_PROVIDERS
 
@@ -31,8 +38,6 @@ if TYPE_CHECKING:
 
 app = typer.Typer(help="M.I.K.E.Y — personal AI cognitive operating system (Gen 1)")
 console = Console()
-
-BASE = f"http://127.0.0.1:{CONFIG.port}"
 
 
 def _server_running() -> bool:
@@ -94,12 +99,6 @@ def serve() -> None:
     uvicorn.run(create_app(), host="127.0.0.1", port=CONFIG.port)
 
 
-def _served_tag(ev: dict[str, Any], primary: str) -> str:
-    """Mark an event that a non-primary (local fallback) model produced."""
-    served = ev.get("served_by")
-    return f" [yellow](via {served})[/yellow]" if served and served != primary else ""
-
-
 def _fallback_subtitle(ev: dict[str, Any], primary: str) -> str | None:
     """What to say when someone other than the primary answered.
 
@@ -131,33 +130,6 @@ def _fallback_subtitle(ev: dict[str, Any], primary: str) -> str | None:
         f"[yellow]on local model ({served}) — every cloud provider was "
         "rate-limited or offline[/yellow]"
     )
-
-
-def _preview_block(preview: dict[str, Any] | None) -> tuple[str, str]:
-    """Render an action's simulated effect for an approval card, plus the border
-    color the card should use. Gen 3's rule is that nothing destructive is approved
-    from its arguments alone — so when a preview says data will be lost, the card
-    says so loudly and shows the diff/dry-run underneath."""
-    if not preview:
-        return "", "yellow"
-    detail = str(preview.get("detail", "")).rstrip()
-    # ASCII only: a cp1252 console cannot encode U+26A0 and would raise mid-render,
-    # and an approval card is the last place that may fail to print.
-    if preview.get("destructive"):
-        head = "[bold red]DESTRUCTIVE[/bold red]"
-        if not preview.get("reversible"):
-            head += " [red](cannot be undone)[/red]"
-        color = "red"
-    else:
-        head = "[green]safe — nothing is overwritten[/green]"
-        color = "yellow"
-    if not preview.get("simulated"):
-        head += " [yellow](not simulated — effect unknown)[/yellow]"
-    block = f"\n{head}\n[bold]{preview.get('summary', '')}[/bold]"
-    if detail:
-        # escape() so a diff line starting with "[" is not eaten as rich markup
-        block += f"\n[dim]{escape(detail)}[/dim]"
-    return block, color
 
 
 def _quota_line(health: dict[str, Any]) -> str | None:
@@ -301,17 +273,8 @@ def _collect_nudges(
 def _handle_approval(
     client: httpx.Client, ev: dict[str, Any], mouth: Any | None = None
 ) -> None:
-    args = json.dumps(ev.get("args", {}), ensure_ascii=False)
-    body = f"[bold]{ev['tool']}[/bold]\n{args}\n[dim]{ev.get('reason', '')}[/dim]"
-    # A second brain's read of the action, when present (S1 critic).
-    note = ev.get("critic_note")
-    if note:
-        color = "green" if ev.get("critic_sound") else "red"
-        label = "critic" if ev.get("critic_sound") else "CRITIC!"  # ASCII: see _preview_block
-        body += f"\n[{color}]{label}: {note}[/{color}]"
     preview = ev.get("preview") or {}
-    block, border = _preview_block(ev.get("preview"))
-    body += block
+    body, border = approval_body(ev)
     console.print(
         Panel(body, title="approval required", border_style=border)
     )
@@ -330,10 +293,7 @@ def _handle_approval(
     answer = console.input("[yellow]approve? \\[y]es / \\[n]o / \\[s]ession: [/yellow]").strip().lower()
     approved = answer in ("y", "yes", "s", "session")
     scope = "session" if answer in ("s", "session") else "once"
-    client.post(
-        f"{BASE}/v1/approvals/{ev['approval_id']}",
-        json={"approved": approved, "scope": scope},
-    )
+    send_approval(client, ev["approval_id"], approved, scope)
 
 
 def _new_session_id() -> str:
@@ -464,45 +424,39 @@ def _run_turn(
     tier = "T1"
     try:
         status.start()
-        with client.stream(
-            "POST", f"{BASE}/v1/turns", json={"session_id": session, "input": user_input}
-        ) as resp:
-            for line in resp.iter_lines():
-                if not line.startswith("data: "):
-                    continue
-                ev = json.loads(line[6:])
-                kind = ev["kind"]
-                status.stop()
-                if kind == "status":
-                    turn_id = ev["turn_id"]
-                    # Surface when a non-default brain handled the turn, so
-                    # the routing (S1) is visible — e.g. a sign-off going to
-                    # the toolless conversation brain.
-                    if ev.get("brain") and ev["brain"] != "operator":
-                        console.print(f"[dim]· {ev['brain']} brain[/dim]")
-                    # And flag a private turn kept on-device (S3).
-                    if ev.get("tier") == "T0":
-                        tier = "T0"
-                        console.print("[green]· private — kept on-device[/green]")
-                elif kind == "action":
-                    args = json.dumps(ev["args"], ensure_ascii=False)[:120]
-                    console.print(f"[dim]→ {ev['tool']} {args}[/dim]{_served_tag(ev, primary)}")
-                elif kind == "approval_request":
-                    _handle_approval(client, ev, mouth)
-                elif kind == "action_result":
-                    mark = "[green]ok[/green]" if ev["ok"] else "[red]failed[/red]"
-                    console.print(f"[dim]← {ev['tool']} {mark}[/dim]")
-                elif kind == "final":
-                    console.print(Panel(
-                        ev["text"], border_style="cyan", title="mikey",
-                        subtitle=_fallback_subtitle(ev, primary),
-                    ))
-                    _speak(mouth, ev["text"], tier)
-                elif kind == "error":
-                    console.print(f"[red]error:[/red] {ev['message']}")
-                    _speak(mouth, "Something went wrong on that one.", tier)
-                if kind not in ("final", "error"):
-                    status.start()  # resume the spinner while the turn continues
+        for ev in stream_turn(client, session, user_input):
+            kind = ev["kind"]
+            status.stop()
+            if kind == "status":
+                turn_id = ev["turn_id"]
+                # Surface when a non-default brain handled the turn, so
+                # the routing (S1) is visible — e.g. a sign-off going to
+                # the toolless conversation brain.
+                if ev.get("brain") and ev["brain"] != "operator":
+                    console.print(f"[dim]· {ev['brain']} brain[/dim]")
+                # And flag a private turn kept on-device (S3).
+                if ev.get("tier") == "T0":
+                    tier = "T0"
+                    console.print("[green]· private — kept on-device[/green]")
+            elif kind == "action":
+                args = json.dumps(ev["args"], ensure_ascii=False)[:120]
+                console.print(f"[dim]→ {ev['tool']} {args}[/dim]{_served_tag(ev, primary)}")
+            elif kind == "approval_request":
+                _handle_approval(client, ev, mouth)
+            elif kind == "action_result":
+                mark = "[green]ok[/green]" if ev["ok"] else "[red]failed[/red]"
+                console.print(f"[dim]← {ev['tool']} {mark}[/dim]")
+            elif kind == "final":
+                console.print(Panel(
+                    ev["text"], border_style="cyan", title="mikey",
+                    subtitle=_fallback_subtitle(ev, primary),
+                ))
+                _speak(mouth, ev["text"], tier)
+            elif kind == "error":
+                console.print(f"[red]error:[/red] {ev['message']}")
+                _speak(mouth, "Something went wrong on that one.", tier)
+            if kind not in ("final", "error"):
+                status.start()  # resume the spinner while the turn continues
     except KeyboardInterrupt:
         console.print(
             "\n[dim](turn canceled — any in-flight action may still finish)[/dim]"
@@ -517,6 +471,39 @@ def _run_turn(
     finally:
         status.stop()
     return turn_id
+
+
+@app.command()
+def hud(
+    session: str = typer.Option("", help="resume a named session (default: start a new one)"),
+    resume: bool = typer.Option(
+        False, "--continue", "-c", help="continue the most recent conversation"
+    ),
+) -> None:
+    """A full-screen dashboard you can leave open: chat on the left, state on the right.
+
+    Same conversation, same approval cards, same nudges as `mikey chat` — the
+    difference is that which model is answering, how much of today's allowance is
+    left and whether the audit chain still verifies stay on screen instead of
+    scrolling away in a banner.
+    """
+    try:
+        from apps.tui.app import MikeyHud
+    except ImportError:
+        console.print(
+            "[red]the HUD needs the `tui` extra:[/red] uv sync --extra tui\n"
+            "[dim]everything it shows is also available from `mikey chat`, "
+            "`mikey spend` and `mikey doctor`.[/dim]"
+        )
+        raise typer.Exit(1) from None
+
+    _ensure_server()
+    health = httpx.get(f"{BASE}/v1/health", timeout=5.0).json()
+    if not session:
+        # Same rule as `mikey chat`: a fresh surface is a fresh conversation, so
+        # an unrelated question cannot inherit the last one's history.
+        session = (_latest_session_id() or _new_session_id()) if resume else _new_session_id()
+    MikeyHud(session=session, primary=health["provider"]).run()
 
 
 def _speak(mouth: Any | None, text: str, tier: str = "T1") -> None:

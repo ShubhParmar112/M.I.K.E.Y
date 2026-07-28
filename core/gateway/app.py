@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from core.config import CONFIG, Config, available_cloud_providers
 from core.cost.governor import CostGovernor
+from core.events.schema import EventType
 from core.events.store import EventStore
 from core.executor_client import ExecutorClient
 from core.ingest.files import FileIngestor
@@ -297,6 +298,36 @@ def create_app(config: Config = CONFIG, adapter: ModelAdapter | None = None) -> 
     @app.get("/v1/events")
     async def get_events(limit: int = 20) -> dict[str, Any]:
         return {"events": [e.model_dump(mode="json") for e in events.recent(limit=limit)]}
+
+    @app.get("/v1/missions")
+    async def list_missions() -> dict[str, Any]:
+        """Unfinished missions, for a surface that wants to show what is still owed.
+
+        `active()` deliberately excludes failed ones, but a mission that stopped on
+        a failed step is precisely the one nobody remembers is waiting — so this
+        reports both, with the status attached.
+        """
+        open_ = list(missions.active())
+        seen = {m.id for m in open_}
+        for ev in events.recent(types=[EventType.MISSION_CREATED.value], limit=1000):
+            mid = ev.payload["mission_id"]
+            if mid in seen:
+                continue
+            state = missions.state(mid)
+            if state is not None and state.status == "failed":
+                open_.append(state)
+        return {
+            "missions": [
+                {
+                    "id": m.id,
+                    "goal": m.goal,
+                    "status": m.status,
+                    "steps": len(m.steps),
+                    "next_step": m.next_step,
+                }
+                for m in open_
+            ]
+        }
 
     @app.get("/v1/health")
     async def health() -> dict[str, Any]:

@@ -15,6 +15,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# `uv sync --extra tui`. The HUD is a second surface, not a replacement: everything
+# it does is also reachable from the plain CLI, so a machine that cannot run a
+# full-screen terminal app loses nothing but the dashboard.
+tui = [
+    "textual>=0.80",
+]
 # `uv sync --extra voice`. Kept optional: M.I.K.E.Y is fully usable as text, and
 # these pull a speech model and a PortAudio binding that a headless install has no
 # use for. Speech recognition runs on-device (no audio ever leaves the machine).
